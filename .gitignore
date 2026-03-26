@@ -13,7 +13,8 @@ venv/
 dist/
 build/
 
-# Agent runtime cache
+# Agent runtime data — excluded so Railway deploys don't overwrite live trades
+positions.json
 .recs_cache.json
 
 # OS / IDE

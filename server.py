@@ -9,6 +9,7 @@ Usage:
 
 import html as _esc
 import json
+import os
 import re
 import subprocess
 import sys
@@ -19,7 +20,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-PORT            = 7823
+# Railway injects PORT as an env var; fall back to 7823 for local dev
+PORT            = int(os.environ.get("PORT", 7823))
 BASE_DIR        = Path(__file__).parent
 RECS_CACHE_FILE = BASE_DIR / ".recs_cache.json"
 MAX_ALERTS      = 20
@@ -1360,8 +1362,14 @@ if __name__ == "__main__":
     t = threading.Thread(target=_watchdog, daemon=True)
     t.start()
 
-    server = ThreadingHTTPServer(("localhost", PORT), _Handler)
-    print(f"Options Agent dashboard -> http://localhost:{PORT}", flush=True)
+    # Ensure positions.json exists so the UI never 500s on first boot
+    positions_file = BASE_DIR / "positions.json"
+    if not positions_file.exists():
+        positions_file.write_text("[]", encoding="utf-8")
+
+    # Bind to 0.0.0.0 so Railway (and any reverse proxy) can reach us
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), _Handler)
+    print(f"Options Agent dashboard -> http://0.0.0.0:{PORT}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
