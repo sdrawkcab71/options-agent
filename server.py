@@ -23,6 +23,18 @@ from urllib.parse import parse_qs, urlparse
 # Railway injects PORT as an env var; fall back to 7823 for local dev
 PORT            = int(os.environ.get("PORT", 7823))
 BASE_DIR        = Path(__file__).parent
+
+# Load .env.local / .env for local dev (Railway sets vars directly)
+try:
+    from dotenv import load_dotenv as _ld
+    _ld(BASE_DIR / ".env.local")
+    _ld(BASE_DIR / ".env")
+except ImportError:
+    pass
+
+# ── Market-bar cache (avoid hammering yfinance on every page load) ─────────────
+_market_bar_cache: dict = {"data": None, "ts": 0.0}
+_MARKET_BAR_TTL = 300  # seconds (5 minutes)
 RECS_CACHE_FILE = BASE_DIR / ".recs_cache.json"
 MAX_ALERTS      = 20
 
@@ -83,6 +95,71 @@ def _load_positions() -> list[dict]:
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return []
     return [p for p in data if isinstance(p, dict) and "ticker" in p and "_comment" not in p]
+
+
+def _get_polygon_key() -> str:
+    """Return the Polygon API key from env, or empty string if not set."""
+    return os.environ.get("POLYGON_API_KEY", "")
+
+
+def _fetch_market_bar() -> dict:
+    """
+    Return a quick market snapshot for the dashboard top bar.
+    Cached for _MARKET_BAR_TTL seconds to avoid hammering yfinance.
+
+    Returns:
+        Dict with keys: spy, qqq, iwm, vix and their % changes.
+    """
+    now = time.monotonic()
+    if _market_bar_cache["data"] and now - _market_bar_cache["ts"] < _MARKET_BAR_TTL:
+        return _market_bar_cache["data"]  # type: ignore[return-value]
+
+    result: dict = {}
+    try:
+        import yfinance as yf  # type: ignore[import]
+        for sym, key in [("SPY", "spy"), ("QQQ", "qqq"), ("IWM", "iwm"), ("^VIX", "vix")]:
+            fi   = yf.Ticker(sym).fast_info
+            last = float(fi.get("last_price") or 0)
+            prev = float(fi.get("previous_close") or last)
+            chg  = (last - prev) / prev * 100 if prev else 0.0
+            result[key]          = round(last, 2)
+            result[key + "_chg"] = round(chg, 2)
+    except Exception:
+        pass
+
+    if result:
+        _market_bar_cache["data"] = result
+        _market_bar_cache["ts"]   = now
+    return result
+
+
+def _fetch_signals(ticker: str) -> dict:
+    """
+    Build a full SignalReport for ticker using Polygon daily bars.
+    Returns the report as a JSON-safe dict, or an error dict on failure.
+
+    Args:
+        ticker: Stock symbol (e.g. 'NVDA').
+    Returns:
+        JSON-safe dict from SignalReport.to_dict(), or {"error": "..."}.
+    """
+    key = _get_polygon_key()
+    if not key:
+        return {"error": "POLYGON_API_KEY not configured."}
+    try:
+        sys.path.insert(0, str(BASE_DIR))
+        from src.polygon import PolygonClient   # type: ignore[import]
+        from src.signals import build_report    # type: ignore[import]
+
+        client = PolygonClient(key)
+        resp   = client.daily_bars(ticker, lookback_days=90)
+        bars   = resp.get("results", [])
+        if len(bars) < 30:
+            return {"error": f"Not enough price history for {ticker} ({len(bars)} bars)."}
+        report = build_report(ticker, bars)
+        return report.to_dict()
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
 def _save_positions(positions: list[dict]) -> None:
@@ -205,6 +282,8 @@ _HTML = r"""<!DOCTYPE html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Options Agent</title>
+  <!-- TradingView Lightweight Charts v4 -->
+  <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
   <style>
     /* ── Design tokens (SharpEdge palette) ── */
     :root {
@@ -509,6 +588,107 @@ _HTML = r"""<!DOCTYPE html>
     @keyframes fadeUp  { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
     @keyframes slideIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
 
+    /* ── Market bar (top strip) ── */
+    .market-bar {
+      background: var(--surface); border-bottom: 1px solid var(--border);
+      padding: 7px 16px; display: flex; gap: 0; overflow-x: auto;
+      flex-shrink: 0; scrollbar-width: none;
+    }
+    .market-bar::-webkit-scrollbar { display: none; }
+    .market-chip {
+      display: flex; align-items: center; gap: 6px; padding: 4px 14px 4px 0;
+      border-right: 1px solid var(--border); margin-right: 14px; flex-shrink: 0;
+      cursor: pointer; transition: opacity 0.15s;
+    }
+    .market-chip:last-child { border-right: none; }
+    .market-chip:hover { opacity: 0.8; }
+    .market-chip-sym  { font-weight: 800; font-size: 12px; }
+    .market-chip-px   { font-size: 12px; }
+    .market-chip-chg  { font-size: 11px; font-weight: 700; padding: 1px 6px; border-radius: 4px; }
+    .chg-up   { color: var(--green); background: rgba(16,185,129,0.12); }
+    .chg-down { color: var(--red);   background: rgba(239,68,68,0.12);  }
+    .chg-flat { color: var(--muted); background: rgba(148,163,184,0.1); }
+
+    /* ── Signals view ── */
+    #signals-view { display: none; }
+    .sig-search-row { display: flex; gap: 8px; margin-bottom: 14px; }
+
+    /* ── Verdict card ── */
+    .verdict-card {
+      border-radius: 14px; padding: 18px; margin-bottom: 14px;
+      border: 1px solid; position: relative; overflow: hidden;
+    }
+    .verdict-card.bull { background: rgba(16,185,129,0.08);  border-color: rgba(16,185,129,0.3); }
+    .verdict-card.bear { background: rgba(239,68,68,0.08);   border-color: rgba(239,68,68,0.3);  }
+    .verdict-card.neutral { background: rgba(245,158,11,0.07); border-color: rgba(245,158,11,0.3); }
+    .verdict-ticker { font-size: 22px; font-weight: 900; letter-spacing: 0.5px; }
+    .verdict-price  { font-size: 14px; color: var(--muted); margin-top: 2px; }
+    .verdict-badge  {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 20px; font-weight: 900; margin: 12px 0 6px; letter-spacing: 0.5px;
+    }
+    .verdict-badge.bull    { color: var(--green);  }
+    .verdict-badge.bear    { color: var(--red);    }
+    .verdict-badge.neutral { color: var(--yellow); }
+    .verdict-headline { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
+    .verdict-score-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+    .verdict-score-bar { flex: 1; height: 8px; background: var(--border2); border-radius: 4px; overflow: hidden; }
+    .verdict-score-fill { height: 100%; border-radius: 4px; transition: width 0.6s ease; }
+    .verdict-score-val { font-weight: 900; font-size: 16px; width: 48px; text-align: right; }
+    .verdict-action {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 8px 16px; border-radius: 10px; font-weight: 800; font-size: 13px;
+      margin-top: 4px; border: 1px solid;
+    }
+    .verdict-action.bull    { background: rgba(16,185,129,0.15); border-color: rgba(16,185,129,0.4); color: var(--green); }
+    .verdict-action.bear    { background: rgba(239,68,68,0.15);  border-color: rgba(239,68,68,0.4);  color: var(--red);   }
+    .verdict-action.neutral { background: rgba(245,158,11,0.12); border-color: rgba(245,158,11,0.35); color: var(--yellow); }
+    .verdict-conf { color: var(--faint); font-size: 11px; margin-left: auto; }
+
+    /* ── Chart panels ── */
+    .chart-section { margin-bottom: 14px; }
+    .chart-label {
+      color: var(--faint); font-size: 10px; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 5px;
+    }
+    .chart-legend { display: flex; gap: 14px; margin-bottom: 6px; flex-wrap: wrap; }
+    .legend-item  { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--muted); }
+    .legend-dot   { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    #main-chart, #macd-chart {
+      border-radius: 10px; overflow: hidden;
+      border: 1px solid var(--border);
+    }
+
+    /* ── Signal cards grid ── */
+    .signal-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .signal-card {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 12px; padding: 13px 13px 11px; transition: all 0.15s;
+    }
+    .signal-card:hover { border-color: var(--border2); }
+    .signal-card.full-width { grid-column: span 2; }
+    .sig-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .sig-name  { font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; }
+    .sig-badge {
+      font-size: 9px; font-weight: 800; padding: 2px 8px;
+      border-radius: 10px; text-transform: uppercase; letter-spacing: 0.4px;
+    }
+    .sig-badge.bull    { background: rgba(16,185,129,0.15); color: var(--green);  }
+    .sig-badge.bear    { background: rgba(239,68,68,0.15);  color: var(--red);    }
+    .sig-badge.neutral { background: rgba(245,158,11,0.12); color: var(--yellow); }
+    .sig-headline { font-size: 12px; font-weight: 600; margin-bottom: 6px; line-height: 1.4; }
+    .sig-kid {
+      font-size: 11px; color: var(--muted); line-height: 1.5;
+      background: rgba(255,255,255,0.03); border-radius: 6px;
+      padding: 7px 9px; margin-bottom: 7px;
+    }
+    .sig-value { color: var(--faint); font-size: 10px; font-family: monospace; }
+    .sig-strength { display: flex; gap: 3px; margin-top: 7px; }
+    .sig-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--border2); }
+    .sig-dot.lit.bull    { background: var(--green);  }
+    .sig-dot.lit.bear    { background: var(--red);    }
+    .sig-dot.lit.neutral { background: var(--yellow); }
+
     /* ── Log Trade button ── */
     .pos-section-header { display: flex; justify-content: space-between; align-items: center; margin: 20px 0 10px; }
     .pos-section-header .section-title { margin: 0; }
@@ -611,6 +791,30 @@ _HTML = r"""<!DOCTYPE html>
   </div>
 </header>
 
+<!-- ── Market Bar ────────────────────────────────────────────────────────── -->
+<div class="market-bar" id="market-bar">
+  <div class="market-chip" onclick="runCmd('pulse','Market Pulse','SPY · QQQ · VIX · Regime')">
+    <span class="market-chip-sym">SPY</span>
+    <span class="market-chip-px" id="mb-spy-px">—</span>
+    <span class="market-chip-chg chg-flat" id="mb-spy-chg">—</span>
+  </div>
+  <div class="market-chip" onclick="runCmd('pulse','Market Pulse','SPY · QQQ · VIX · Regime')">
+    <span class="market-chip-sym">QQQ</span>
+    <span class="market-chip-px" id="mb-qqq-px">—</span>
+    <span class="market-chip-chg chg-flat" id="mb-qqq-chg">—</span>
+  </div>
+  <div class="market-chip" onclick="runCmd('pulse','Market Pulse','SPY · QQQ · VIX · Regime')">
+    <span class="market-chip-sym">IWM</span>
+    <span class="market-chip-px" id="mb-iwm-px">—</span>
+    <span class="market-chip-chg chg-flat" id="mb-iwm-chg">—</span>
+  </div>
+  <div class="market-chip">
+    <span class="market-chip-sym">VIX</span>
+    <span class="market-chip-px" id="mb-vix-px">—</span>
+    <span class="market-chip-chg chg-flat" id="mb-vix-chg">—</span>
+  </div>
+</div>
+
 <!-- ── Main ─────────────────────────────────────────────────────────────────── -->
 <main id="main-scroll">
 
@@ -707,6 +911,58 @@ _HTML = r"""<!DOCTYPE html>
     </div>
 
   </div><!-- /#home-view -->
+
+  <!-- SIGNALS VIEW -->
+  <div id="signals-view">
+
+    <!-- Ticker search -->
+    <div class="sig-search-row">
+      <input id="sig-ticker" class="ticker-input" placeholder="Enter ticker (e.g. NVDA)" maxlength="6" />
+      <button class="ticker-btn" onclick="analyzeSignals()">Analyze ⚡</button>
+    </div>
+
+    <!-- Loading / empty state -->
+    <div id="sig-empty" style="text-align:center;padding:50px 20px;color:var(--faint);font-size:13px">
+      Enter a ticker above to see signals, chart, and a plain-English verdict.<br>
+      <span style="font-size:24px;display:block;margin-top:12px">📊</span>
+    </div>
+
+    <!-- Verdict card -->
+    <div id="sig-verdict" style="display:none"></div>
+
+    <!-- Main candlestick chart -->
+    <div id="sig-chart-section" style="display:none">
+      <div class="chart-section">
+        <div class="chart-label">Price · SMA 20 · SMA 50</div>
+        <div class="chart-legend">
+          <div class="legend-item"><div class="legend-dot" style="background:#10B981"></div>Green candle = up day</div>
+          <div class="legend-item"><div class="legend-dot" style="background:#EF4444"></div>Red candle = down day</div>
+          <div class="legend-item"><div class="legend-dot" style="background:#3B82F6"></div>SMA 20-day</div>
+          <div class="legend-item"><div class="legend-dot" style="background:#8B5CF6"></div>SMA 50-day</div>
+          <div class="legend-item"><div class="legend-dot" style="background:#10B981"></div>↑ Buy signal</div>
+          <div class="legend-item"><div class="legend-dot" style="background:#EF4444"></div>↓ Sell signal</div>
+        </div>
+        <div id="main-chart" style="height:260px"></div>
+      </div>
+      <div class="chart-section">
+        <div class="chart-label">MACD — momentum engine</div>
+        <div class="chart-legend">
+          <div class="legend-item"><div class="legend-dot" style="background:#3B82F6"></div>MACD line</div>
+          <div class="legend-item"><div class="legend-dot" style="background:#F59E0B"></div>Signal line</div>
+          <div class="legend-item"><div class="legend-dot" style="background:#10B981"></div>Green bars = building momentum</div>
+          <div class="legend-item"><div class="legend-dot" style="background:#EF4444"></div>Red bars = losing momentum</div>
+        </div>
+        <div id="macd-chart" style="height:110px"></div>
+      </div>
+    </div>
+
+    <!-- Signal cards -->
+    <div id="sig-cards" style="display:none">
+      <p class="section-title" style="margin-top:4px">Signal Breakdown</p>
+      <div class="signal-grid" id="sig-grid"></div>
+    </div>
+
+  </div><!-- /#signals-view -->
 
   <!-- OUTPUT VIEW -->
   <div id="output-view">
@@ -831,6 +1087,11 @@ _HTML = r"""<!DOCTYPE html>
     <span class="nav-label">Monitor</span>
     <div class="nav-indicator"></div>
   </button>
+  <button class="nav-btn" id="nav-signals" onclick="navTo('signals')">
+    <span class="nav-icon">⚡</span>
+    <span class="nav-label">Signals</span>
+    <div class="nav-indicator"></div>
+  </button>
   <button class="nav-btn" id="nav-alerts" onclick="toggleAlerts()">
     <span class="nav-icon">🔔</span>
     <span class="nav-label">Alerts</span>
@@ -845,19 +1106,234 @@ _HTML = r"""<!DOCTYPE html>
   let _lastAlertId = 0;
   let _activeNav   = 'home';
 
-  // ── Boot: load recs + positions, start SSE ────────────────────────────────
+  // ── Boot: load recs + positions + market bar, start SSE ──────────────────
   window.addEventListener('DOMContentLoaded', () => {
     loadRecs();
     loadPositions();
+    loadMarketBar();
     startSSE();
+    // Re-poll market bar every 5 minutes
+    setInterval(loadMarketBar, 5 * 60 * 1000);
   });
+
+  // ── Market bar ─────────────────────────────────────────────────────────────
+  async function loadMarketBar() {
+    try {
+      const d = await fetch('/api/market-bar').then(r => r.json());
+      const set = (id, val, chg) => {
+        const px  = document.getElementById(id + '-px');
+        const ch  = document.getElementById(id + '-chg');
+        if (!px || !ch) return;
+        px.textContent  = val ? '$' + val.toFixed(2) : '—';
+        if (chg !== undefined) {
+          const sign  = chg >= 0 ? '+' : '';
+          ch.textContent = sign + chg.toFixed(2) + '%';
+          ch.className   = 'market-chip-chg ' + (chg > 0.05 ? 'chg-up' : chg < -0.05 ? 'chg-down' : 'chg-flat');
+        }
+      };
+      set('mb-spy', d.spy,  d.spy_chg);
+      set('mb-qqq', d.qqq,  d.qqq_chg);
+      set('mb-iwm', d.iwm,  d.iwm_chg);
+      // VIX: show level only, colour by absolute value
+      const vixEl = document.getElementById('mb-vix-px');
+      const vixCh = document.getElementById('mb-vix-chg');
+      if (vixEl && d.vix) {
+        vixEl.textContent  = d.vix.toFixed(1);
+        const label        = d.vix >= 30 ? 'FEAR' : d.vix >= 25 ? 'HIGH' : d.vix >= 20 ? 'OK' : 'LOW';
+        vixCh.textContent  = label;
+        vixCh.className    = 'market-chip-chg ' + (d.vix >= 25 ? 'chg-down' : d.vix <= 15 ? 'chg-up' : 'chg-flat');
+      }
+    } catch (_) { /* silent — market bar is cosmetic */ }
+  }
+
+  // ── Signals page ───────────────────────────────────────────────────────────
+  let _lastSigTicker = '';
+  let _mainChart     = null;
+  let _macdChart     = null;
+
+  document.getElementById('sig-ticker').addEventListener('keydown', e => {
+    if (e.key === 'Enter') analyzeSignals();
+  });
+
+  function analyzeSignals() {
+    const t = document.getElementById('sig-ticker').value.trim().toUpperCase();
+    if (!t) return;
+    _lastSigTicker = t;
+    navTo('signals');
+    _loadSignals(t);
+  }
+
+  async function _loadSignals(ticker) {
+    // Show loading
+    document.getElementById('sig-empty').innerHTML =
+      `<div class="loading-wrap"><div class="spinner"></div><div class="loading-text">Analyzing ${ticker}…</div></div>`;
+    document.getElementById('sig-empty').style.display    = 'block';
+    document.getElementById('sig-verdict').style.display  = 'none';
+    document.getElementById('sig-chart-section').style.display = 'none';
+    document.getElementById('sig-cards').style.display    = 'none';
+
+    try {
+      const data = await fetch('/api/signals?t=' + ticker).then(r => r.json());
+      if (data.error) {
+        document.getElementById('sig-empty').innerHTML =
+          `<div style="color:var(--red);padding:40px;text-align:center">⚠️ ${data.error}</div>`;
+        return;
+      }
+      document.getElementById('sig-empty').style.display = 'none';
+      _renderVerdict(data);
+      _renderChart(data);
+      _renderSignalCards(data.signals);
+    } catch (e) {
+      document.getElementById('sig-empty').innerHTML =
+        `<div style="color:var(--red);padding:40px;text-align:center">⚠️ ${e.message}</div>`;
+    }
+  }
+
+  // ── Verdict card renderer ──────────────────────────────────────────────────
+  function _renderVerdict(d) {
+    const el     = document.getElementById('sig-verdict');
+    const pct    = (d.score / 10) * 100;
+    const colour = d.overall === 'bull' ? '#10B981' : d.overall === 'bear' ? '#EF4444' : '#F59E0B';
+    const label  = d.overall === 'bull' ? '🟢 BULLISH' : d.overall === 'bear' ? '🔴 BEARISH' : '🟡 MIXED';
+    const chgCls = d.price_change_pct >= 0 ? 'chg-up' : 'chg-down';
+    const chgStr = (d.price_change_pct >= 0 ? '+' : '') + d.price_change_pct.toFixed(2) + '% today';
+    const barGrad = d.overall === 'bull'
+      ? 'linear-gradient(90deg,#10B981,#06B6D4)'
+      : d.overall === 'bear'
+      ? 'linear-gradient(90deg,#EF4444,#F59E0B)'
+      : 'linear-gradient(90deg,#F59E0B,#94A3B8)';
+
+    el.className      = `verdict-card ${d.overall}`;
+    el.style.display  = 'block';
+    el.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:flex-start">
+        <div>
+          <div class="verdict-ticker">${d.ticker}</div>
+          <div class="verdict-price">$${d.price.toFixed(2)} &nbsp;<span class="market-chip-chg ${chgCls}">${chgStr}</span></div>
+        </div>
+        <div style="text-align:right">
+          <div style="color:var(--faint);font-size:10px;font-weight:700;text-transform:uppercase">Confidence</div>
+          <div style="font-weight:800;font-size:13px;color:${colour}">${d.confidence}</div>
+        </div>
+      </div>
+      <div class="verdict-badge ${d.overall}">${label}</div>
+      <div class="verdict-headline">${d.headline}</div>
+      <div class="verdict-score-row">
+        <span style="color:var(--faint);font-size:11px;width:44px">Score</span>
+        <div class="verdict-score-bar">
+          <div class="verdict-score-fill" style="width:${pct}%;background:${barGrad}"></div>
+        </div>
+        <span class="verdict-score-val" style="color:${colour}">${d.score}/10</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;margin-top:6px">
+        <div class="verdict-action ${d.overall}">${d.action}</div>
+        <div class="verdict-conf">Not financial advice</div>
+      </div>`;
+  }
+
+  // ── Chart renderer (TradingView Lightweight Charts) ───────────────────────
+  function _renderChart(d) {
+    const section = document.getElementById('sig-chart-section');
+    section.style.display = 'block';
+
+    const chartOpts = (container) => ({
+      layout:   { background: { color: '#141D2E' }, textColor: '#94A3B8' },
+      grid:     { vertLines: { color: '#1E2D42' }, horzLines: { color: '#1E2D42' } },
+      crosshair: { mode: 0 },
+      rightPriceScale: { borderColor: '#1E2D42' },
+      timeScale: { borderColor: '#1E2D42', timeVisible: true },
+      handleScroll: { mouseWheel: false, pressedMouseMove: true },
+      handleScale:  { mouseWheel: false, pinch: true },
+      width:  container.clientWidth  || 340,
+      height: parseInt(container.style.height) || 260,
+    });
+
+    // ── Main chart (candlestick + SMA20 + SMA50 + volume) ─────────────────
+    const mainEl = document.getElementById('main-chart');
+    if (_mainChart) { try { _mainChart.remove(); } catch(_){} }
+    _mainChart = LightweightCharts.createChart(mainEl, chartOpts(mainEl));
+
+    const candleSeries = _mainChart.addCandlestickSeries({
+      upColor: '#10B981', downColor: '#EF4444',
+      borderUpColor: '#10B981', borderDownColor: '#EF4444',
+      wickUpColor: '#10B981', wickDownColor: '#EF4444',
+    });
+    const sma20Series = _mainChart.addLineSeries({
+      color: '#3B82F6', lineWidth: 1.5, priceLineVisible: false, lastValueVisible: false,
+    });
+    const sma50Series = _mainChart.addLineSeries({
+      color: '#8B5CF6', lineWidth: 1.5, priceLineVisible: false, lastValueVisible: false,
+    });
+
+    if (d.candles?.length)   candleSeries.setData(d.candles);
+    if (d.sma20_line?.length) sma20Series.setData(d.sma20_line);
+    if (d.sma50_line?.length) sma50Series.setData(d.sma50_line);
+    if (d.markers?.length)   candleSeries.setMarkers(d.markers);
+    _mainChart.timeScale().fitContent();
+
+    // ── MACD chart ────────────────────────────────────────────────────────
+    const macdEl = document.getElementById('macd-chart');
+    if (_macdChart) { try { _macdChart.remove(); } catch(_){} }
+    _macdChart = LightweightCharts.createChart(macdEl, { ...chartOpts(macdEl), height: 110 });
+
+    const histSeries = _macdChart.addHistogramSeries({ priceLineVisible: false, lastValueVisible: false });
+    const macdLine   = _macdChart.addLineSeries({ color: '#3B82F6', lineWidth: 1.5, priceLineVisible: false, lastValueVisible: false });
+    const sigLine    = _macdChart.addLineSeries({ color: '#F59E0B', lineWidth: 1,   priceLineVisible: false, lastValueVisible: false });
+
+    if (d.macd_data?.length) {
+      histSeries.setData(d.macd_data.map(p => ({
+        time:  p.time, value: p.hist,
+        color: p.hist >= 0 ? '#10B98177' : '#EF444477',
+      })));
+      macdLine.setData(d.macd_data.map(p => ({ time: p.time, value: p.macd   })));
+      sigLine.setData(d.macd_data.map( p => ({ time: p.time, value: p.signal })));
+    }
+    _macdChart.timeScale().fitContent();
+
+    // Sync scroll/zoom between charts
+    _mainChart.timeScale().subscribeVisibleLogicalRangeChange(r => {
+      if (r) _macdChart.timeScale().setVisibleLogicalRange(r);
+    });
+    _macdChart.timeScale().subscribeVisibleLogicalRangeChange(r => {
+      if (r) _mainChart.timeScale().setVisibleLogicalRange(r);
+    });
+  }
+
+  // ── Signal cards renderer ──────────────────────────────────────────────────
+  function _renderSignalCards(signals) {
+    const wrap = document.getElementById('sig-cards');
+    const grid = document.getElementById('sig-grid');
+    wrap.style.display = 'block';
+
+    grid.innerHTML = signals.map((s, i) => {
+      const isLast    = i === signals.length - 1 && signals.length % 2 !== 0;
+      const badges    = { bull: '▲ BULLISH', bear: '▼ BEARISH', neutral: '◆ NEUTRAL' };
+      const dots      = [1,2,3].map(n =>
+        `<div class="sig-dot ${n <= s.strength ? 'lit ' + s.verdict : ''}"></div>`
+      ).join('');
+      return `
+        <div class="signal-card ${isLast ? 'full-width' : ''}">
+          <div class="sig-header">
+            <span class="sig-name">${s.emoji} ${s.name}</span>
+            <span class="sig-badge ${s.verdict}">${badges[s.verdict] || s.verdict}</span>
+          </div>
+          <div class="sig-headline">${s.headline}</div>
+          <div class="sig-kid">💬 "${s.kid_explain}"</div>
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <div class="sig-value">${s.value_label}</div>
+            <div class="sig-strength" title="Signal strength">${dots}</div>
+          </div>
+        </div>`;
+    }).join('');
+  }
 
   // ── Navigation ─────────────────────────────────────────────────────────────
   function navTo(tab) {
     _activeNav = tab;
-    document.getElementById('home-view').style.display   = tab === 'home' ? 'block' : 'none';
-    document.getElementById('output-view').style.display = tab !== 'home' ? 'block' : 'none';
-    ['home','pulse','scan','monitor','alerts'].forEach(t => {
+    document.getElementById('home-view').style.display    = tab === 'home'    ? 'block' : 'none';
+    document.getElementById('signals-view').style.display = tab === 'signals' ? 'block' : 'none';
+    document.getElementById('output-view').style.display  = (tab !== 'home' && tab !== 'signals') ? 'block' : 'none';
+    ['home','pulse','scan','monitor','signals','alerts'].forEach(t => {
       document.getElementById('nav-' + t)?.classList.toggle('active', t === tab);
     });
     document.getElementById('main-scroll').scrollTop = 0;
@@ -1252,6 +1728,17 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/api/chart":
             ticker = qs.get("t", ["SPY"])[0].upper()[:6]
             self._send_text(_run(["chart", ticker]))
+
+        # ── API: signal analysis (signals engine + chart data) ──
+        elif path == "/api/signals":
+            ticker = qs.get("t", ["SPY"])[0].upper()[:6]
+            data   = _fetch_signals(ticker)
+            self._send(200, "application/json", json.dumps(data).encode())
+
+        # ── API: market bar snapshot (SPY/QQQ/IWM/VIX quick chips) ──
+        elif path == "/api/market-bar":
+            self._send(200, "application/json",
+                       json.dumps(_fetch_market_bar()).encode())
 
         # ── API: positions (read) ──
         elif path == "/api/positions":
