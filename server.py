@@ -83,6 +83,19 @@ def _load_positions() -> list[dict]:
     return [p for p in data if isinstance(p, dict) and "ticker" in p and "_comment" not in p]
 
 
+def _save_positions(positions: list[dict]) -> None:
+    """
+    Persist the positions list to positions.json.
+
+    Args:
+        positions: List of position dicts to save.
+    """
+    (BASE_DIR / "positions.json").write_text(
+        json.dumps(positions, indent=2),
+        encoding="utf-8",
+    )
+
+
 def _load_recs() -> list[dict]:
     """Load cached trade recommendations from last scan."""
     try:
@@ -494,6 +507,83 @@ _HTML = r"""<!DOCTYPE html>
     @keyframes fadeUp  { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
     @keyframes slideIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
 
+    /* ── Log Trade button ── */
+    .pos-section-header { display: flex; justify-content: space-between; align-items: center; margin: 20px 0 10px; }
+    .pos-section-header .section-title { margin: 0; }
+    .log-trade-btn {
+      background: rgba(59,130,246,0.12); border: 1px solid rgba(59,130,246,0.35);
+      color: var(--blue); border-radius: 8px; padding: 5px 12px;
+      font-size: 11px; font-weight: 700; cursor: pointer; transition: all 0.15s;
+    }
+    .log-trade-btn:hover { background: rgba(59,130,246,0.22); }
+
+    /* ── Delete button on position card ── */
+    .pos-delete {
+      background: none; border: none; color: var(--faint);
+      font-size: 18px; cursor: pointer; padding: 0; line-height: 1; transition: color 0.15s;
+    }
+    .pos-delete:hover { color: var(--red); }
+    .pos-cost { color: var(--faint); font-size: 11px; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); }
+
+    /* ── Trade modal (bottom sheet) ── */
+    .modal-overlay {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,0.6); z-index: 50;
+    }
+    .modal {
+      position: fixed; bottom: 0; left: 0; right: 0;
+      background: var(--surface); border-top: 1px solid var(--border);
+      border-radius: 16px 16px 0 0; z-index: 60;
+      max-height: 88vh; overflow-y: auto;
+      transform: translateY(100%);
+      transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .modal.open { transform: translateY(0); }
+    .modal-header {
+      padding: 16px 18px 12px; border-bottom: 1px solid var(--border);
+      display: flex; justify-content: space-between; align-items: center;
+      position: sticky; top: 0; background: var(--surface); z-index: 1;
+    }
+    .modal-title { font-weight: 800; font-size: 16px; }
+    .modal-close { background: none; border: none; color: var(--muted); font-size: 24px; cursor: pointer; line-height: 1; }
+    .modal-body  { padding: 16px 18px 32px; }
+
+    /* ── Form ── */
+    .form-row   { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .form-group { display: flex; flex-direction: column; gap: 5px; margin-bottom: 14px; }
+    .form-label { color: var(--muted); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; }
+    .form-input {
+      background: var(--card); border: 1px solid var(--border2);
+      border-radius: 9px; padding: 10px 12px; color: var(--text);
+      font-size: 14px; outline: none; transition: border-color 0.15s; width: 100%;
+    }
+    .form-input:focus { border-color: var(--blue); }
+    .form-input.uc { text-transform: uppercase; }
+    select.form-input { cursor: pointer; }
+    select.form-input option { background: var(--surface); }
+    input[type="date"].form-input::-webkit-calendar-picker-indicator { filter: invert(0.5); cursor: pointer; }
+
+    /* ── Cost summary box ── */
+    .cost-summary {
+      background: rgba(59,130,246,0.07); border: 1px solid rgba(59,130,246,0.2);
+      border-radius: 9px; padding: 12px 14px; margin-bottom: 14px;
+      display: none; flex-direction: column; gap: 6px;
+    }
+    .cost-summary.visible { display: flex; }
+    .cost-row { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); }
+    .cost-val  { font-weight: 700; color: var(--text); }
+    .cost-warn { color: var(--yellow) !important; }
+    .cost-over { color: var(--red)    !important; }
+
+    /* ── Submit button ── */
+    .submit-btn {
+      width: 100%; background: var(--blue); border: none; border-radius: 10px;
+      padding: 13px; color: white; font-weight: 700; font-size: 14px;
+      cursor: pointer; transition: background 0.15s;
+    }
+    .submit-btn:hover    { background: #2563EB; }
+    .submit-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
     /* ── Scrollbar ── */
     ::-webkit-scrollbar { width: 3px; }
     ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
@@ -579,8 +669,11 @@ _HTML = r"""<!DOCTYPE html>
     </div>
 
     <!-- Open positions -->
-    <p class="section-title">Open Positions</p>
-    <div id="positions-panel">POSITIONS_PLACEHOLDER</div>
+    <div class="pos-section-header">
+      <p class="section-title">Open Positions</p>
+      <button class="log-trade-btn" onclick="openTradeModal()">+ Log Trade</button>
+    </div>
+    <div id="positions-panel"><div class="empty-state">Loading…</div></div>
 
     <!-- Guardrails -->
     <p class="section-title">Guardrails</p>
@@ -639,6 +732,78 @@ _HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<!-- ── Trade Log Modal ──────────────────────────────────────────────────────── -->
+<div class="modal-overlay" id="modal-overlay" onclick="closeModal()"></div>
+<div class="modal" id="trade-modal">
+  <div class="modal-header">
+    <div class="modal-title">📝 Log Trade</div>
+    <button class="modal-close" onclick="closeModal()">×</button>
+  </div>
+  <div class="modal-body">
+    <form id="trade-form" onsubmit="submitTrade(event)" autocomplete="off">
+
+      <div class="form-row">
+        <div class="form-group">
+          <div class="form-label">Symbol</div>
+          <input id="f-ticker" class="form-input uc" type="text" placeholder="NVDA" maxlength="6" required>
+        </div>
+        <div class="form-group">
+          <div class="form-label">Type</div>
+          <select id="f-type" class="form-input">
+            <option value="call">Call ▲</option>
+            <option value="put">Put ▼</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <div class="form-label">Strike ($)</div>
+          <input id="f-strike" class="form-input" type="number" placeholder="175.00" step="0.50" min="0.01" required>
+        </div>
+        <div class="form-group">
+          <div class="form-label">Expiry</div>
+          <input id="f-expiry" class="form-input" type="date" required>
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <div class="form-label">Contracts</div>
+          <input id="f-contracts" class="form-input" type="number" placeholder="1" min="1" value="1" required>
+        </div>
+        <div class="form-group">
+          <div class="form-label">Fill Price ($/contract)</div>
+          <input id="f-entry" class="form-input" type="number" placeholder="2.50" step="0.01" min="0.01" required>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <div class="form-label">Notes <span style="color:var(--faint);text-transform:none;font-weight:400">(optional)</span></div>
+        <input id="f-notes" class="form-input" type="text" placeholder="e.g. Flow signal, breakout play">
+      </div>
+
+      <!-- Live cost calculator -->
+      <div class="cost-summary" id="cost-summary">
+        <div class="cost-row">
+          <span>Total cost</span>
+          <span class="cost-val" id="cost-total">$0</span>
+        </div>
+        <div class="cost-row">
+          <span>Max loss (if expires worthless)</span>
+          <span class="cost-val cost-over" id="cost-maxloss">$0</span>
+        </div>
+        <div class="cost-row" id="cost-pct-row">
+          <span>% of $5,000 capital</span>
+          <span class="cost-val" id="cost-pct">0%</span>
+        </div>
+      </div>
+
+      <button type="submit" class="submit-btn" id="submit-btn">Log Trade</button>
+    </form>
+  </div>
+</div>
+
 <!-- ── Toast container ─────────────────────────────────────────────────────── -->
 <div id="toast-container"></div>
 
@@ -681,6 +846,7 @@ _HTML = r"""<!DOCTYPE html>
   // ── Boot: load recs + positions, start SSE ────────────────────────────────
   window.addEventListener('DOMContentLoaded', () => {
     loadRecs();
+    loadPositions();
     startSSE();
   });
 
@@ -886,6 +1052,149 @@ _HTML = r"""<!DOCTYPE html>
     setTimeout(() => toast.remove(), 8000);
   }
 
+  // ── Positions: load + render ───────────────────────────────────────────────
+  async function loadPositions() {
+    try {
+      const res       = await fetch('/api/positions');
+      const positions = await res.json();
+      renderPositions(positions);
+    } catch (_) { /* silent */ }
+  }
+
+  function renderPositions(positions) {
+    const el = document.getElementById('positions-panel');
+    if (!positions || positions.length === 0) {
+      el.innerHTML = `<div class="empty-state">
+        No open positions.<br>
+        <span style="color:var(--faint)">Tap <strong style="color:var(--blue)">+ Log Trade</strong> to record a trade from Fidelity.</span>
+      </div>`;
+      return;
+    }
+    el.innerHTML = positions.map((p, i) => {
+      const ctype = (p.contract_type || 'call').toLowerCase();
+      // Total cost = fill price × contracts × 100 (1 contract = 100 shares)
+      const cost  = ((p.entry_price || 0) * (p.contracts || 1) * 100).toFixed(0);
+      const pct   = ((parseFloat(cost) / 5000) * 100).toFixed(1);
+      return `
+        <div class="pos-card" style="animation:fadeUp 0.2s ease">
+          <div class="pos-header">
+            <div style="display:flex;align-items:center;gap:10px">
+              <span class="pos-ticker">${p.ticker}</span>
+              <span class="pos-type ${ctype}">${ctype.toUpperCase()}</span>
+            </div>
+            <button class="pos-delete" onclick="deletePosition(${i})" title="Remove position">×</button>
+          </div>
+          <div class="pos-meta">
+            <div class="pos-stat">
+              <div class="pos-stat-label">Strike</div>
+              <div class="pos-stat-val">$${p.strike}</div>
+            </div>
+            <div class="pos-stat">
+              <div class="pos-stat-label">Expiry</div>
+              <div class="pos-stat-val">${p.expiry}</div>
+            </div>
+            <div class="pos-stat">
+              <div class="pos-stat-label">Qty</div>
+              <div class="pos-stat-val">${p.contracts}</div>
+            </div>
+            <div class="pos-stat">
+              <div class="pos-stat-label">Entry</div>
+              <div class="pos-stat-val">$${p.entry_price}</div>
+            </div>
+          </div>
+          <div class="pos-cost">
+            Total cost: <strong style="color:var(--text)">$${cost}</strong>
+            &nbsp;·&nbsp; ${pct}% of capital
+            ${p.notes ? `&nbsp;·&nbsp; ${p.notes}` : ''}
+          </div>
+        </div>`;
+    }).join('');
+  }
+
+  async function deletePosition(index) {
+    if (!confirm('Remove this position from tracking?')) return;
+    await fetch('/api/positions?i=' + index, { method: 'DELETE' });
+    await loadPositions();
+  }
+
+  // ── Trade log modal ────────────────────────────────────────────────────────
+  function openTradeModal() {
+    document.getElementById('modal-overlay').style.display = 'block';
+    document.getElementById('trade-modal').classList.add('open');
+    // Default expiry to ~2 weeks out
+    const d = new Date();
+    d.setDate(d.getDate() + 14);
+    document.getElementById('f-expiry').value =
+      d.toISOString().slice(0, 10);
+    setTimeout(() => document.getElementById('f-ticker').focus(), 300);
+  }
+
+  function closeModal() {
+    document.getElementById('modal-overlay').style.display = 'none';
+    document.getElementById('trade-modal').classList.remove('open');
+  }
+
+  // Live cost calculator — updates as user types fill price or contracts
+  ['f-entry', 'f-contracts'].forEach(id => {
+    document.getElementById(id).addEventListener('input', updateCostSummary);
+  });
+
+  function updateCostSummary() {
+    const entry     = parseFloat(document.getElementById('f-entry').value)     || 0;
+    const contracts = parseInt(document.getElementById('f-contracts').value)   || 0;
+    const summary   = document.getElementById('cost-summary');
+    if (!entry || !contracts) { summary.classList.remove('visible'); return; }
+
+    const CAPITAL = 5000;
+    const total   = entry * contracts * 100;   // 1 contract = 100 shares
+    const pct     = (total / CAPITAL * 100).toFixed(1);
+    const isOver  = total > CAPITAL * 0.20;    // guardrail: max 20%
+
+    document.getElementById('cost-total').textContent  = '$' + total.toFixed(2);
+    document.getElementById('cost-maxloss').textContent = '$' + total.toFixed(2);
+    const pctEl = document.getElementById('cost-pct');
+    pctEl.textContent = pct + '%';
+    pctEl.className   = 'cost-val' + (isOver ? ' cost-over' : pct > 15 ? ' cost-warn' : '');
+    summary.classList.add('visible');
+  }
+
+  async function submitTrade(e) {
+    e.preventDefault();
+    const btn    = document.getElementById('submit-btn');
+    btn.textContent = 'Saving…';
+    btn.disabled    = true;
+
+    const notes = document.getElementById('f-notes').value.trim();
+    const trade = {
+      ticker:        document.getElementById('f-ticker').value.toUpperCase().trim(),
+      contract_type: document.getElementById('f-type').value,
+      strike:        parseFloat(document.getElementById('f-strike').value),
+      expiry:        document.getElementById('f-expiry').value,
+      contracts:     parseInt(document.getElementById('f-contracts').value),
+      entry_price:   parseFloat(document.getElementById('f-entry').value),
+      logged_at:     new Date().toISOString(),
+      ...(notes && { notes }),
+    };
+
+    try {
+      const res = await fetch('/api/positions', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(trade),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      closeModal();
+      document.getElementById('trade-form').reset();
+      document.getElementById('cost-summary').classList.remove('visible');
+      await loadPositions();
+    } catch (err) {
+      alert('Failed to save trade: ' + err.message);
+    } finally {
+      btn.textContent = 'Log Trade';
+      btn.disabled    = false;
+    }
+  }
+
   // ── Alerts drawer toggle ───────────────────────────────────────────────────
   function toggleAlerts() {
     const drawer  = document.getElementById('alerts-drawer');
@@ -905,52 +1214,6 @@ _HTML = r"""<!DOCTYPE html>
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Position HTML renderer (server-side)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _render_positions_html() -> str:
-    """Render open positions as HTML cards for injection into the template."""
-    positions = _load_positions()
-    if not positions:
-        return '<div class="empty-state">No open positions.<br>Edit <code>positions.json</code> to track trades.</div>'
-
-    cards: list[str] = []
-    for p in positions:
-        ticker    = _esc.escape(str(p.get("ticker", "?")))
-        ctype     = str(p.get("contract_type", "call")).lower()
-        strike    = p.get("strike", "—")
-        expiry    = _esc.escape(str(p.get("expiry", "—")))
-        contracts = p.get("contracts", 1)
-        entry     = p.get("entry_price", "—")
-        cards.append(f"""
-        <div class="pos-card">
-          <div class="pos-header">
-            <span class="pos-ticker">{ticker}</span>
-            <span class="pos-type {ctype}">{ctype.upper()}</span>
-          </div>
-          <div class="pos-meta">
-            <div class="pos-stat">
-              <div class="pos-stat-label">Strike</div>
-              <div class="pos-stat-val">${strike}</div>
-            </div>
-            <div class="pos-stat">
-              <div class="pos-stat-label">Expiry</div>
-              <div class="pos-stat-val">{expiry}</div>
-            </div>
-            <div class="pos-stat">
-              <div class="pos-stat-label">Contracts</div>
-              <div class="pos-stat-val">{contracts}</div>
-            </div>
-            <div class="pos-stat">
-              <div class="pos-stat-label">Entry</div>
-              <div class="pos-stat-val">${entry}</div>
-            </div>
-          </div>
-        </div>""")
-    return "\n".join(cards)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # HTTP handler
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -963,8 +1226,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         # ── SPA shell ──
         if path == "/":
-            page = _HTML.replace("POSITIONS_PLACEHOLDER", _render_positions_html())
-            self._send(200, "text/html; charset=utf-8", page.encode())
+            self._send(200, "text/html; charset=utf-8", _HTML.encode())
 
         # ── API: agent commands ──
         elif path == "/api/pulse":
@@ -988,6 +1250,11 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/api/chart":
             ticker = qs.get("t", ["SPY"])[0].upper()[:6]
             self._send_text(_run(["chart", ticker]))
+
+        # ── API: positions (read) ──
+        elif path == "/api/positions":
+            positions = _load_positions()
+            self._send(200, "application/json", json.dumps(positions).encode())
 
         # ── API: cached recommendations ──
         elif path == "/api/recs":
@@ -1035,6 +1302,50 @@ class _Handler(BaseHTTPRequestHandler):
                 time.sleep(1.5)
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass  # Client disconnected — clean exit
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/positions":
+            length = int(self.headers.get("Content-Length", 0))
+            body   = self.rfile.read(length)
+            try:
+                trade = json.loads(body)
+            except json.JSONDecodeError as exc:
+                self._send(400, "text/plain; charset=utf-8", str(exc).encode())
+                return
+
+            # Validate required fields
+            required = ["ticker", "contract_type", "strike", "expiry", "contracts", "entry_price"]
+            missing  = [f for f in required if f not in trade]
+            if missing:
+                self._send(400, "text/plain; charset=utf-8",
+                           f"Missing fields: {', '.join(missing)}".encode())
+                return
+
+            positions = _load_positions()
+            positions.append(trade)
+            _save_positions(positions)
+            self._send(200, "application/json", b'{"ok":true}')
+        else:
+            self.send_error(404)
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        qs     = parse_qs(parsed.query)
+        if parsed.path == "/api/positions":
+            try:
+                idx       = int(qs.get("i", ["-1"])[0])
+                positions = _load_positions()
+                if 0 <= idx < len(positions):
+                    positions.pop(idx)
+                    _save_positions(positions)
+                    self._send(200, "application/json", b'{"ok":true}')
+                else:
+                    self._send(400, "text/plain; charset=utf-8", b"Invalid index")
+            except (ValueError, IndexError) as exc:
+                self._send(400, "text/plain; charset=utf-8", str(exc).encode())
+        else:
+            self.send_error(404)
 
     def log_message(self, fmt: str, *args: object) -> None:  # noqa: N802
         pass  # Suppress per-request logs
