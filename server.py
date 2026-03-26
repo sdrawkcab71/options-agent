@@ -34,7 +34,7 @@ except ImportError:
 
 # ── Market-bar cache (avoid hammering yfinance on every page load) ─────────────
 _market_bar_cache: dict = {"data": None, "ts": 0.0}
-_MARKET_BAR_TTL = 300  # seconds (5 minutes)
+_MARKET_BAR_TTL = 60   # seconds — refresh every minute for near-real-time quotes
 RECS_CACHE_FILE = BASE_DIR / ".recs_cache.json"
 MAX_ALERTS      = 20
 
@@ -104,26 +104,51 @@ def _get_polygon_key() -> str:
 
 def _fetch_market_bar() -> dict:
     """
-    Return a quick market snapshot for the dashboard top bar.
-    Cached for _MARKET_BAR_TTL seconds to avoid hammering yfinance.
+    Return a near-real-time market snapshot for the dashboard top bar.
+    Cached for _MARKET_BAR_TTL seconds.
+
+    Symbols fetched: SPY, QQQ, IWM, VIX, ^DJI (Dow), ^IXIC (Nasdaq Composite).
 
     Returns:
-        Dict with keys: spy, qqq, iwm, vix and their % changes.
+        Dict with price + % change for each symbol, keyed as e.g. spy / spy_chg.
     """
     now = time.monotonic()
     if _market_bar_cache["data"] and now - _market_bar_cache["ts"] < _MARKET_BAR_TTL:
         return _market_bar_cache["data"]  # type: ignore[return-value]
 
     result: dict = {}
+    SYMBOLS = [
+        ("SPY",   "spy"),
+        ("QQQ",   "qqq"),
+        ("IWM",   "iwm"),
+        ("^VIX",  "vix"),
+        ("^DJI",  "dji"),
+        ("^IXIC", "ixic"),
+    ]
     try:
         import yfinance as yf  # type: ignore[import]
-        for sym, key in [("SPY", "spy"), ("QQQ", "qqq"), ("IWM", "iwm"), ("^VIX", "vix")]:
-            fi   = yf.Ticker(sym).fast_info
-            last = float(fi.get("last_price") or 0)
-            prev = float(fi.get("previous_close") or last)
-            chg  = (last - prev) / prev * 100 if prev else 0.0
-            result[key]          = round(last, 2)
-            result[key + "_chg"] = round(chg, 2)
+        for sym, key in SYMBOLS:
+            last, prev = 0.0, 0.0
+            try:
+                # fast_info is the lightweight yfinance path
+                fi   = yf.Ticker(sym).fast_info
+                last = float(fi.last_price   or 0)
+                prev = float(fi.previous_close or last)
+            except Exception:
+                last = 0.0
+            # Fallback: pull last 2 daily bars when fast_info returns zero
+            if last <= 0:
+                try:
+                    hist = yf.Ticker(sym).history(period="2d")
+                    if not hist.empty:
+                        last = float(hist["Close"].iloc[-1])
+                        prev = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else last
+                except Exception:
+                    pass
+            if last > 0:
+                chg = (last - prev) / prev * 100 if prev else 0.0
+                result[key]          = round(last, 2)
+                result[key + "_chg"] = round(chg,  2)
     except Exception:
         pass
 
@@ -160,6 +185,146 @@ def _fetch_signals(ticker: str) -> dict:
         return report.to_dict()
     except Exception as exc:
         return {"error": str(exc)}
+
+
+def _fetch_scan_json() -> dict:
+    """
+    Run the full scan pipeline and return structured JSON for the visual
+    scan-cards UI.  Calls src modules directly (no subprocess) so we get
+    typed objects back instead of terminal text.
+
+    Returns:
+        Dict with keys: trades (list[dict]), vix (float), error (str|None).
+    """
+    key = _get_polygon_key()
+    if not key:
+        return {"error": "POLYGON_API_KEY not configured.", "trades": [], "vix": 0.0}
+    try:
+        sys.path.insert(0, str(BASE_DIR))
+        from src.scanner import run_full_scan   # type: ignore[import]
+        from src.scorer  import score_trade     # type: ignore[import]
+
+        # Grab live VIX for the scorer's IV-environment factor
+        vix = 15.0
+        try:
+            import yfinance as yf  # type: ignore[import]
+            vix = float(yf.Ticker("^VIX").fast_info.get("last_price") or 15.0)
+        except Exception:
+            pass
+
+        setups = run_full_scan(key)
+        trades: list[dict] = []
+        for setup in setups:
+            scored = score_trade(setup, vix)
+            flow   = scored.setup.flow
+            tech   = scored.setup.tech
+            trades.append({
+                "ticker":            flow.ticker,
+                "direction":         flow.direction,
+                "score":             scored.score,
+                "score_breakdown":   scored.score_breakdown,
+                "stock_price":       flow.stock_price,
+                "strike":            flow.strike,
+                "contract_type":     flow.contract_type,
+                "expiry":            flow.expiry,
+                "dte":               flow.dte,
+                "ask":               flow.ask,
+                "bid":               flow.bid,
+                "spread":            round(flow.spread, 2),
+                "iv":                round(flow.iv * 100, 1),
+                "delta":             round(flow.delta, 2),
+                "vol_oi_ratio":      flow.vol_oi_ratio,
+                "est_premium":       flow.estimated_premium,
+                "contracts":         scored.position_size_contracts,
+                "position_size_usd": scored.position_size_usd,
+                "max_loss":          round(flow.ask * 100 * scored.position_size_contracts, 0),
+                "target_low":        scored.setup.target_low,
+                "target_high":       scored.setup.target_high,
+                "stop_loss":         scored.setup.stop_loss,
+                "pop_estimate":      scored.pop_estimate,
+                "expected_value":    scored.expected_value,
+                "why":               scored.why,
+                "risk_flags":        scored.risk_flags,
+                "no_trade_reason":   scored.no_trade_reason,
+                "tech": {
+                    "trend":          tech.trend,
+                    "momentum":       tech.momentum,
+                    "direction":      tech.direction,
+                    "rsi":            round(tech.rsi, 1),
+                    "volume_ratio":   round(tech.volume_ratio, 1),
+                    "volume_signal":  tech.volume_signal,
+                    "squeeze":        tech.squeeze,
+                    "bb_width_pct":   round(tech.bb_width_pct * 100, 1),
+                    "sma20":          round(tech.sma20, 2),
+                    "sma50":          round(tech.sma50, 2),
+                    "price":          round(tech.price, 2),
+                    "summary":        tech.summary,
+                },
+            })
+
+        # Keep the recommendations panel fresh with the latest scan
+        recs = [
+            {
+                "ticker":    t["ticker"],
+                "direction": t["direction"],
+                "score":     t["score"],
+                "trade":     (f"BUY {t['contracts']}x {t['ticker']} "
+                              f"${t['strike']:.0f} {t['contract_type'].upper()} "
+                              f"exp {t['expiry']}"),
+                "ask":       str(t["ask"]),
+                "max_loss":  str(int(t["max_loss"])),
+                "pop":       str(int(t["pop_estimate"])),
+            }
+            for t in trades
+            if not t["no_trade_reason"]
+        ][:5]
+        if recs:
+            _save_recs(recs)
+
+        return {"trades": trades, "vix": round(vix, 1), "error": None}
+    except Exception as exc:
+        return {"error": str(exc), "trades": [], "vix": 0.0}
+
+
+def _fetch_news(tickers: list[str] | None = None) -> dict:
+    """
+    Fetch the latest market news from Polygon.io /v2/reference/news.
+    Optionally scoped to specific ticker(s); falls back to general market news.
+
+    Args:
+        tickers: Optional list of ticker symbols to filter news by.
+    Returns:
+        Dict with keys: results (list[dict]), error (str|None).
+    """
+    key = _get_polygon_key()
+    if not key:
+        return {"error": "POLYGON_API_KEY not configured.", "results": []}
+    try:
+        import urllib.request
+        if tickers:
+            qs = f"ticker={tickers[0]}&limit=12&order=desc&apiKey={key}"
+        else:
+            qs = f"limit=15&order=desc&apiKey={key}"
+        url = f"https://api.polygon.io/v2/reference/news?{qs}"
+        with urllib.request.urlopen(url, timeout=12) as resp:  # noqa: S310
+            raw = json.loads(resp.read())
+        results = []
+        for item in raw.get("results", []):
+            # Trim description to keep payload light
+            desc = (item.get("description") or "")[:200]
+            if len(item.get("description") or "") > 200:
+                desc += "…"
+            results.append({
+                "title":     item.get("title", ""),
+                "url":       item.get("article_url", ""),
+                "published": (item.get("published_utc") or "")[:16].replace("T", " "),
+                "tickers":   item.get("tickers", [])[:5],
+                "publisher": (item.get("publisher") or {}).get("name", ""),
+                "description": desc,
+            })
+        return {"results": results, "error": None}
+    except Exception as exc:
+        return {"error": str(exc), "results": []}
 
 
 def _save_positions(positions: list[dict]) -> None:
@@ -462,6 +627,81 @@ _HTML = r"""<!DOCTYPE html>
     .guardrail-label { color: var(--muted); font-size: 12px; }
     .guardrail-val   { font-weight: 700; font-size: 12px; }
 
+    /* ── Scan visual cards ── */
+    .scan-empty {
+      text-align: center; padding: 60px 20px; color: var(--faint); font-size: 13px;
+    }
+    .scan-card {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 14px; margin-bottom: 16px; overflow: hidden;
+      animation: fadeUp 0.25s ease both;
+    }
+    .scan-card.bull    { border-left: 3px solid var(--green);  }
+    .scan-card.bear    { border-left: 3px solid var(--red);    }
+    .scan-card.notrade { border-left: 3px solid var(--yellow); opacity: 0.78; }
+    .scan-card-header {
+      padding: 13px 16px 11px; display: flex; align-items: center; gap: 10px;
+      border-bottom: 1px solid var(--border); flex-wrap: wrap;
+    }
+    .scan-ticker      { font-size: 20px; font-weight: 900; letter-spacing: 0.3px; }
+    .scan-trade-line  { font-size: 11px; color: var(--muted); margin-top: 2px; }
+    .scan-dir-chip {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 800;
+    }
+    .scan-dir-chip.bull { background: rgba(16,185,129,0.15); color: var(--green); }
+    .scan-dir-chip.bear { background: rgba(239,68,68,0.15);  color: var(--red);   }
+    .scan-score-chip {
+      margin-left: auto; font-size: 12px; font-weight: 800;
+      background: var(--surface); border: 1px solid var(--border2);
+      padding: 3px 10px; border-radius: 8px; white-space: nowrap;
+    }
+    .scan-card-body {
+      display: grid; grid-template-columns: 104px 1fr;
+    }
+    .scan-gauges {
+      padding: 14px 6px 10px 14px; display: flex; flex-direction: column;
+      align-items: center; gap: 10px; border-right: 1px solid var(--border);
+    }
+    .scan-gauge-label {
+      font-size: 9px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.5px; color: var(--faint); text-align: center;
+    }
+    .scan-metrics {
+      padding: 12px 16px 8px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px 14px;
+    }
+    .scan-metric-label { font-size: 9px; text-transform: uppercase; color: var(--faint); font-weight: 700; letter-spacing: 0.4px; }
+    .scan-metric-val   { font-size: 13px; font-weight: 800; margin-top: 1px; line-height: 1.3; }
+    .scan-tech-row {
+      display: flex; gap: 10px; flex-wrap: wrap; padding: 2px 16px 12px;
+    }
+    .scan-tech-chip { font-size: 10px; color: var(--faint); display: flex; gap: 4px; align-items: center; }
+    .scan-tech-chip-val { font-weight: 700; color: var(--text); }
+    .scan-breakdown {
+      padding: 10px 16px 12px; border-top: 1px solid var(--border);
+    }
+    .scan-breakdown-title {
+      font-size: 9px; font-weight: 700; text-transform: uppercase;
+      color: var(--faint); letter-spacing: 0.5px; margin-bottom: 8px;
+    }
+    .scan-factor { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+    .scan-factor-name  { font-size: 10px; color: var(--muted); width: 86px; flex-shrink: 0; }
+    .scan-factor-bar   { flex: 1; height: 6px; background: var(--border2); border-radius: 3px; overflow: hidden; }
+    .scan-factor-fill  { height: 100%; border-radius: 3px; transition: width 0.55s ease; }
+    .scan-factor-val   { font-size: 10px; font-weight: 700; width: 22px; text-align: right; color: var(--muted); }
+    .scan-notrade-banner {
+      padding: 10px 16px; background: rgba(245,158,11,0.08);
+      border-top: 1px solid rgba(245,158,11,0.2);
+      color: var(--yellow); font-size: 12px; font-weight: 700;
+    }
+    .scan-footer {
+      padding: 10px 16px 13px; border-top: 1px solid var(--border);
+      font-size: 11px; color: var(--muted); line-height: 1.65;
+    }
+    .scan-why-item  { display: flex; gap: 6px; margin-bottom: 2px; }
+    .scan-why-bullet { color: var(--blue); flex-shrink: 0; }
+    .scan-risk-item  { display: flex; gap: 6px; color: var(--yellow); margin-bottom: 2px; }
+
     /* ── Output view ── */
     #output-view { display: none; }
     .output-header {
@@ -544,6 +784,65 @@ _HTML = r"""<!DOCTYPE html>
     .alert-msg    { font-size: 12px; line-height: 1.5; }
     .alert-meta   { color: var(--faint); font-size: 10px; margin-top: 3px; }
     .no-alerts    { text-align: center; padding: 40px; color: var(--faint); font-size: 12px; }
+
+    /* ── Alerts drawer tabs ── */
+    .drawer-tabs { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+    .drawer-tab {
+      flex: 1; padding: 10px; font-size: 12px; font-weight: 700;
+      color: var(--faint); background: none; border: none; cursor: pointer;
+      border-bottom: 2px solid transparent; transition: all 0.15s;
+    }
+    .drawer-tab.active { color: var(--blue); border-bottom-color: var(--blue); }
+    .drawer-tab-panel { display: none; flex: 1; overflow-y: auto; padding: 12px 16px; }
+    .drawer-tab-panel.active { display: block; }
+
+    /* ── News items ── */
+    .news-item {
+      padding: 11px 0; border-bottom: 1px solid var(--border); cursor: pointer;
+    }
+    .news-item:last-child { border-bottom: none; }
+    .news-title { font-size: 12px; font-weight: 700; line-height: 1.4; color: var(--text); margin-bottom: 4px; }
+    .news-meta  { display: flex; gap: 8px; font-size: 10px; color: var(--faint); flex-wrap: wrap; }
+    .news-ticker-chip {
+      background: rgba(59,130,246,0.15); color: var(--blue);
+      padding: 1px 5px; border-radius: 4px; font-weight: 700;
+    }
+    .news-desc  { font-size: 11px; color: var(--muted); margin-top: 4px; line-height: 1.5; }
+    .news-loading { text-align: center; padding: 30px; color: var(--faint); font-size: 12px; }
+
+    /* ── Onboarding banner ── */
+    .onboarding-banner {
+      background: linear-gradient(135deg, rgba(59,130,246,0.12), rgba(139,92,246,0.1));
+      border: 1px solid rgba(59,130,246,0.3); border-radius: 14px;
+      padding: 16px; margin-bottom: 16px; position: relative;
+    }
+    .onboarding-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 12px;
+    }
+    .onboarding-title { font-size: 14px; font-weight: 800; }
+    .onboarding-dismiss {
+      background: none; border: none; color: var(--faint); font-size: 18px;
+      cursor: pointer; line-height: 1; padding: 2px 4px;
+    }
+    .onboarding-tips { display: flex; flex-direction: column; gap: 8px; }
+    .onboarding-tip  { display: flex; gap: 10px; align-items: flex-start; font-size: 12px; line-height: 1.5; }
+    .onboarding-tip-num {
+      width: 20px; height: 20px; border-radius: 50%;
+      background: rgba(59,130,246,0.2); color: var(--blue);
+      font-size: 10px; font-weight: 900; display: flex; align-items: center;
+      justify-content: center; flex-shrink: 0; margin-top: 1px;
+    }
+    .onboarding-visits {
+      margin-top: 12px; font-size: 10px; color: var(--faint);
+      display: flex; align-items: center; gap: 8px;
+    }
+    .onboarding-dots { display: flex; gap: 4px; }
+    .onboarding-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--border2); transition: background 0.2s;
+    }
+    .onboarding-dot.seen { background: var(--blue); }
 
     /* ── Toast notifications ── */
     #toast-container {
@@ -808,6 +1107,16 @@ _HTML = r"""<!DOCTYPE html>
     <span class="market-chip-px" id="mb-iwm-px">—</span>
     <span class="market-chip-chg chg-flat" id="mb-iwm-chg">—</span>
   </div>
+  <div class="market-chip" onclick="runCmd('pulse','Market Pulse','SPY · QQQ · VIX · Regime')">
+    <span class="market-chip-sym">DOW</span>
+    <span class="market-chip-px" id="mb-dji-px">—</span>
+    <span class="market-chip-chg chg-flat" id="mb-dji-chg">—</span>
+  </div>
+  <div class="market-chip" onclick="runCmd('pulse','Market Pulse','SPY · QQQ · VIX · Regime')">
+    <span class="market-chip-sym">COMP</span>
+    <span class="market-chip-px" id="mb-ixic-px">—</span>
+    <span class="market-chip-chg chg-flat" id="mb-ixic-chg">—</span>
+  </div>
   <div class="market-chip">
     <span class="market-chip-sym">VIX</span>
     <span class="market-chip-px" id="mb-vix-px">—</span>
@@ -820,6 +1129,40 @@ _HTML = r"""<!DOCTYPE html>
 
   <!-- HOME VIEW -->
   <div id="home-view">
+
+    <!-- Onboarding banner (hidden by JS after 5 visits) -->
+    <div class="onboarding-banner" id="onboarding-banner" style="display:none">
+      <div class="onboarding-header">
+        <div class="onboarding-title">👋 Welcome to Options Agent</div>
+        <button class="onboarding-dismiss" onclick="dismissOnboarding()" title="Dismiss forever">×</button>
+      </div>
+      <div class="onboarding-tips">
+        <div class="onboarding-tip">
+          <div class="onboarding-tip-num">1</div>
+          <div><strong>Run a Full Scan</strong> — it screens your entire watchlist for unusual options flow that agrees with the technical trend. Look for scores ≥ 15/25.</div>
+        </div>
+        <div class="onboarding-tip">
+          <div class="onboarding-tip-num">2</div>
+          <div><strong>Check Market Pulse</strong> first — if VIX &gt; 25 the agent shifts to spreads. If regime is RISK-OFF, stand down on new entries.</div>
+        </div>
+        <div class="onboarding-tip">
+          <div class="onboarding-tip-num">3</div>
+          <div><strong>Signals tab</strong> — enter any ticker for a plain-English verdict with interactive candlestick + MACD charts and buy/sell markers.</div>
+        </div>
+        <div class="onboarding-tip">
+          <div class="onboarding-tip-num">4</div>
+          <div><strong>Log your trades</strong> — tap the 📝 button next to Open Positions to record your Fidelity fills. The agent tracks P&amp;L and flags exits.</div>
+        </div>
+        <div class="onboarding-tip">
+          <div class="onboarding-tip-num">5</div>
+          <div><strong>Alerts &amp; News</strong> — the bell icon streams live VIX/SPY threshold alerts and the latest market news relevant to your positions.</div>
+        </div>
+      </div>
+      <div class="onboarding-visits">
+        <span>Auto-hides after 5 visits</span>
+        <div class="onboarding-dots" id="onboarding-dots"></div>
+      </div>
+    </div>
 
     <p class="section-title">Quick Actions</p>
     <div class="cmd-grid">
@@ -982,11 +1325,20 @@ _HTML = r"""<!DOCTYPE html>
 <div class="alerts-overlay" id="alerts-overlay" onclick="toggleAlerts()"></div>
 <div class="alerts-drawer" id="alerts-drawer">
   <div class="alerts-drawer-header">
-    <div class="alerts-drawer-title">🔔 Alerts</div>
+    <div class="alerts-drawer-title">🔔 Alerts &amp; News</div>
     <button class="alerts-close" onclick="toggleAlerts()">×</button>
   </div>
-  <div class="alerts-list" id="alerts-list">
-    <div class="no-alerts" id="no-alerts-msg">No alerts yet.<br>Monitoring VIX and SPY/QQQ for threshold events.</div>
+  <div class="drawer-tabs">
+    <button class="drawer-tab active" id="tab-alerts" onclick="switchDrawerTab('alerts')">Alerts</button>
+    <button class="drawer-tab" id="tab-news"   onclick="switchDrawerTab('news')">Market News</button>
+  </div>
+  <div class="drawer-tab-panel active" id="panel-alerts">
+    <div class="alerts-list" id="alerts-list" style="padding:0">
+      <div class="no-alerts" id="no-alerts-msg">No alerts yet.<br>Monitoring VIX and SPY/QQQ for threshold events.</div>
+    </div>
+  </div>
+  <div class="drawer-tab-panel" id="panel-news">
+    <div id="news-list"><div class="news-loading">⏳ Loading news…</div></div>
   </div>
 </div>
 
@@ -1106,42 +1458,139 @@ _HTML = r"""<!DOCTYPE html>
   let _lastAlertId = 0;
   let _activeNav   = 'home';
 
+  // ── Cookie helpers ──────────────────────────────────────────────────────────
+  function getCookie(name) {
+    const m = document.cookie.match('(?:^|; )' + name + '=([^;]*)');
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+  function setCookie(name, value, days) {
+    const exp = new Date(Date.now() + days * 864e5).toUTCString();
+    document.cookie = `${name}=${encodeURIComponent(value)};expires=${exp};path=/;SameSite=Lax`;
+  }
+
+  // ── Onboarding (cookie-tracked, hides after 5 visits) ──────────────────────
+  function initOnboarding() {
+    const MAX_VISITS = 5;
+    const visits = parseInt(getCookie('oag_visits') || '0') + 1;
+    setCookie('oag_visits', visits, 365);
+    const banner = document.getElementById('onboarding-banner');
+    const dots   = document.getElementById('onboarding-dots');
+    // Render visit progress dots
+    if (dots) {
+      dots.innerHTML = Array.from({ length: MAX_VISITS }, (_, i) =>
+        `<div class="onboarding-dot${i < visits ? ' seen' : ''}"></div>`
+      ).join('');
+    }
+    if (visits <= MAX_VISITS) {
+      banner.style.display = 'block';
+    }
+  }
+
+  function dismissOnboarding() {
+    document.getElementById('onboarding-banner').style.display = 'none';
+    setCookie('oag_visits', '99', 365);   // skip forever
+  }
+
+  // ── Drawer tab switching ────────────────────────────────────────────────────
+  function switchDrawerTab(tab) {
+    ['alerts','news'].forEach(t => {
+      document.getElementById('tab-' + t).classList.toggle('active', t === tab);
+      document.getElementById('panel-' + t).classList.toggle('active', t === tab);
+    });
+    if (tab === 'news') loadNews();
+  }
+
+  // ── Market news (Polygon /api/news) ────────────────────────────────────────
+  let _newsLoaded = false;
+  async function loadNews(tickers) {
+    const el = document.getElementById('news-list');
+    if (!el) return;
+    // Only show loading spinner on first fetch
+    if (!_newsLoaded) el.innerHTML = '<div class="news-loading">⏳ Fetching market news…</div>';
+    try {
+      const qs = tickers ? tickers.map(t => 't=' + encodeURIComponent(t)).join('&') : '';
+      const data = await fetch('/api/news' + (qs ? '?' + qs : '')).then(r => r.json());
+      if (data.error) {
+        el.innerHTML = `<div class="news-loading" style="color:var(--red)">⚠ ${data.error}</div>`;
+        return;
+      }
+      const items = (data.results || []);
+      if (items.length === 0) {
+        el.innerHTML = '<div class="news-loading">No news found.</div>';
+        return;
+      }
+      el.innerHTML = items.map(n => {
+        const chips = (n.tickers || []).map(tk =>
+          `<span class="news-ticker-chip">${tk}</span>`
+        ).join('');
+        return `<div class="news-item" onclick="window.open('${n.url}','_blank')">
+          <div class="news-title">${n.title}</div>
+          ${n.description ? `<div class="news-desc">${n.description}</div>` : ''}
+          <div class="news-meta">
+            ${n.publisher ? `<span>${n.publisher}</span>` : ''}
+            ${n.published ? `<span>${n.published.replace('T',' ')}</span>` : ''}
+            ${chips}
+          </div>
+        </div>`;
+      }).join('');
+      _newsLoaded = true;
+    } catch (e) {
+      el.innerHTML = `<div class="news-loading" style="color:var(--red)">Network error</div>`;
+    }
+  }
+
   // ── Boot: load recs + positions + market bar, start SSE ──────────────────
   window.addEventListener('DOMContentLoaded', () => {
+    initOnboarding();
     loadRecs();
     loadPositions();
     loadMarketBar();
     startSSE();
-    // Re-poll market bar every 5 minutes
-    setInterval(loadMarketBar, 5 * 60 * 1000);
+    // Re-poll market bar every 60 seconds for real-time quotes
+    setInterval(loadMarketBar, 60 * 1000);
+    // Refresh news every 10 minutes when drawer is open
+    setInterval(() => { if (_newsLoaded) loadNews(); }, 10 * 60 * 1000);
   });
 
   // ── Market bar ─────────────────────────────────────────────────────────────
   async function loadMarketBar() {
     try {
       const d = await fetch('/api/market-bar').then(r => r.json());
-      const set = (id, val, chg) => {
-        const px  = document.getElementById(id + '-px');
-        const ch  = document.getElementById(id + '-chg');
+
+      // Generic setter — prefix='$' for ETFs, '' for large indices
+      const setChip = (id, val, chg, prefix = '$', decimals = 2) => {
+        const px = document.getElementById(id + '-px');
+        const ch = document.getElementById(id + '-chg');
         if (!px || !ch) return;
-        px.textContent  = val ? '$' + val.toFixed(2) : '—';
-        if (chg !== undefined) {
-          const sign  = chg >= 0 ? '+' : '';
+        if (val) {
+          // Use toLocaleString for large numbers (DJI, IXIC) to add commas
+          px.textContent = prefix + (val >= 1000
+            ? val.toLocaleString('en-US', { maximumFractionDigits: 0 })
+            : val.toFixed(decimals));
+        } else {
+          px.textContent = '—';
+        }
+        if (chg !== undefined && chg !== null) {
+          const sign = chg >= 0 ? '+' : '';
           ch.textContent = sign + chg.toFixed(2) + '%';
-          ch.className   = 'market-chip-chg ' + (chg > 0.05 ? 'chg-up' : chg < -0.05 ? 'chg-down' : 'chg-flat');
+          ch.className = 'market-chip-chg ' + (chg > 0.05 ? 'chg-up' : chg < -0.05 ? 'chg-down' : 'chg-flat');
         }
       };
-      set('mb-spy', d.spy,  d.spy_chg);
-      set('mb-qqq', d.qqq,  d.qqq_chg);
-      set('mb-iwm', d.iwm,  d.iwm_chg);
-      // VIX: show level only, colour by absolute value
+
+      setChip('mb-spy',  d.spy,  d.spy_chg);
+      setChip('mb-qqq',  d.qqq,  d.qqq_chg);
+      setChip('mb-iwm',  d.iwm,  d.iwm_chg);
+      setChip('mb-dji',  d.dji,  d.dji_chg,  '', 0);   // Dow — no $, whole numbers
+      setChip('mb-ixic', d.ixic, d.ixic_chg, '', 0);   // Nasdaq — no $, whole numbers
+
+      // VIX: show level + regime label instead of % change
       const vixEl = document.getElementById('mb-vix-px');
       const vixCh = document.getElementById('mb-vix-chg');
       if (vixEl && d.vix) {
-        vixEl.textContent  = d.vix.toFixed(1);
-        const label        = d.vix >= 30 ? 'FEAR' : d.vix >= 25 ? 'HIGH' : d.vix >= 20 ? 'OK' : 'LOW';
-        vixCh.textContent  = label;
-        vixCh.className    = 'market-chip-chg ' + (d.vix >= 25 ? 'chg-down' : d.vix <= 15 ? 'chg-up' : 'chg-flat');
+        vixEl.textContent = d.vix.toFixed(1);
+        const label = d.vix >= 30 ? 'FEAR' : d.vix >= 25 ? 'HIGH' : d.vix >= 20 ? 'OK' : 'LOW';
+        vixCh.textContent = label;
+        vixCh.className = 'market-chip-chg ' + (d.vix >= 25 ? 'chg-down' : d.vix <= 15 ? 'chg-up' : 'chg-flat');
       }
     } catch (_) { /* silent — market bar is cosmetic */ }
   }
@@ -1354,15 +1803,21 @@ _HTML = r"""<!DOCTYPE html>
     document.getElementById('output-content').innerHTML    =
       `<div class="loading-wrap"><div class="spinner"></div><div class="loading-text">Running ${title.toLowerCase()}…</div></div>`;
 
-    let url = '/api/' + cmd;
+    // Scan uses the structured JSON endpoint for visual cards
+    const isScan = cmd === 'scan';
+    let url = '/api/' + (isScan ? 'scan-json' : cmd);
     if (ticker) url += '?t=' + encodeURIComponent(ticker);
 
     try {
-      const res  = await fetch(url);
-      const text = await res.text();
-      renderOutput(text, cmd);
-      // After a scan, refresh the recommendations panel
-      if (cmd === 'scan') loadRecs();
+      const res = await fetch(url);
+      if (isScan) {
+        const data = await res.json();
+        renderScanCards(data);
+        loadRecs();  // refresh sidebar recommendations with latest results
+      } else {
+        const text = await res.text();
+        renderOutput(text, cmd);
+      }
     } catch (e) {
       document.getElementById('output-content').innerHTML =
         `<pre class="output-pre error">Network error: ${e.message}</pre>`;
@@ -1393,6 +1848,186 @@ _HTML = r"""<!DOCTYPE html>
     const isErr = text.startsWith('ERROR');
     document.getElementById('output-content').innerHTML =
       `<div style="animation:fadeUp 0.2s ease"><pre class="output-pre${isErr ? ' error' : ''}">${hi}</pre></div>`;
+  }
+
+  // ── Scan visual cards renderer ─────────────────────────────────────────────
+  function renderScanCards(data) {
+    const el = document.getElementById('output-content');
+
+    if (data.error) {
+      el.innerHTML = `<pre class="output-pre error">Error: ${data.error}</pre>`;
+      return;
+    }
+
+    const trades = data.trades || [];
+    if (trades.length === 0) {
+      el.innerHTML = `
+        <div class="scan-empty">
+          <div style="font-size:40px;margin-bottom:12px">🔍</div>
+          <div style="font-size:15px;font-weight:700;color:var(--text);margin-bottom:8px">No confirmed setups found</div>
+          <div>The scanner found no tickers where options flow<br>agrees with technical signals right now.</div>
+          <div style="margin-top:12px;color:var(--blue);font-size:12px">VIX: ${data.vix || '—'}</div>
+        </div>`;
+      return;
+    }
+
+    // ── SVG donut gauge ──────────────────────────────────────────────────────
+    function scoreGaugeSvg(score, max, r, cx, cy, strokeW, color) {
+      const circ = 2 * Math.PI * r;
+      const fill = (score / max) * circ;
+      const sz = cx * 2;
+      return `<svg width="${sz}" height="${sz}" viewBox="0 0 ${sz} ${sz}">
+        <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#1E2D42" stroke-width="${strokeW}"/>
+        <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${color}" stroke-width="${strokeW}"
+          stroke-dasharray="${fill.toFixed(1)} ${circ.toFixed(1)}"
+          stroke-linecap="round" transform="rotate(-90 ${cx} ${cy})"/>
+        <text x="${cx}" y="${cy - 4}" text-anchor="middle" fill="${color}"
+          font-size="${r * 0.42}" font-weight="900" font-family="system-ui">${score}</text>
+        <text x="${cx}" y="${cy + r * 0.32}" text-anchor="middle" fill="#475569"
+          font-size="${r * 0.26}" font-family="system-ui">/${max}</text>
+      </svg>`;
+    }
+
+    function popGaugeSvg(pop, r, cx, cy, strokeW) {
+      const color = pop >= 50 ? '#10B981' : pop >= 35 ? '#3B82F6' : '#F59E0B';
+      const circ  = 2 * Math.PI * r;
+      const fill  = (pop / 100) * circ;
+      const sz = cx * 2;
+      return `<svg width="${sz}" height="${sz}" viewBox="0 0 ${sz} ${sz}">
+        <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#1E2D42" stroke-width="${strokeW}"/>
+        <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${color}" stroke-width="${strokeW}"
+          stroke-dasharray="${fill.toFixed(1)} ${circ.toFixed(1)}"
+          stroke-linecap="round" transform="rotate(-90 ${cx} ${cy})"/>
+        <text x="${cx}" y="${cy + r * 0.34}" text-anchor="middle" fill="${color}"
+          font-size="${r * 0.44}" font-weight="900" font-family="system-ui">${pop.toFixed(0)}%</text>
+      </svg>`;
+    }
+
+    const factorColors = {
+      'Flow Conviction':    '#06B6D4',
+      'Technical Alignment':'#10B981',
+      'Risk/Reward':        '#3B82F6',
+      'IV Environment':     '#8B5CF6',
+      'Catalyst':           '#F59E0B',
+    };
+
+    const cards = trades.map((t, i) => {
+      const isBull  = t.direction === 'BULLISH';
+      const noTrade = !!t.no_trade_reason;
+      const cls     = noTrade ? 'notrade' : (isBull ? 'bull' : 'bear');
+      const scoreColor = t.score >= 20 ? '#10B981' : t.score >= 15 ? '#3B82F6' : '#F59E0B';
+
+      const gauge = scoreGaugeSvg(t.score, 25, 30, 38, 38, 7, scoreColor);
+      const pop   = popGaugeSvg(t.pop_estimate, 18, 22, 22, 5);
+
+      // Factor breakdown bars
+      const factorRows = Object.entries(t.score_breakdown).map(([name, pts]) => {
+        const pct  = (pts / 5) * 100;
+        const col  = factorColors[name] || '#3B82F6';
+        const abbr = { 'Technical Alignment': 'Tech Align',
+                       'Flow Conviction':      'Flow Conv.',
+                       'IV Environment':       'IV Environ.' }[name] || name;
+        return `<div class="scan-factor">
+          <div class="scan-factor-name">${abbr}</div>
+          <div class="scan-factor-bar"><div class="scan-factor-fill" style="width:${pct}%;background:${col}"></div></div>
+          <div class="scan-factor-val">${pts}/5</div>
+        </div>`;
+      }).join('');
+
+      // Why & risk bullets
+      const whyHtml = (t.why || []).filter(w => w).map(w =>
+        `<div class="scan-why-item"><span class="scan-why-bullet">▸</span><span>${w}</span></div>`
+      ).join('');
+      const riskHtml = (t.risk_flags || []).map(r =>
+        `<div class="scan-risk-item"><span>⚠</span><span>${r}</span></div>`
+      ).join('');
+
+      // Tech chips
+      const techCol = t.tech.direction === 'BULLISH' ? 'var(--green)'
+                    : t.tech.direction === 'BEARISH'  ? 'var(--red)' : 'var(--yellow)';
+      const rsiCol  = t.tech.rsi < 35 ? 'var(--green)' : t.tech.rsi > 65 ? 'var(--red)' : 'var(--muted)';
+      const evColor = t.expected_value >= 0 ? 'var(--green)' : 'var(--red)';
+      const evSign  = t.expected_value >= 0 ? '+' : '';
+
+      return `
+      <div class="scan-card ${cls}" style="animation-delay:${i * 0.07}s">
+        <div class="scan-card-header">
+          <div>
+            <div class="scan-ticker">${t.ticker}</div>
+            <div class="scan-trade-line">$${t.tech.price.toFixed(2)} · IV ${t.iv}% · Δ ${t.delta} · Vol/OI ${t.vol_oi_ratio}x</div>
+          </div>
+          <div class="scan-dir-chip ${isBull ? 'bull' : 'bear'}">${isBull ? '▲ BULLISH' : '▼ BEARISH'}</div>
+          <div class="scan-score-chip">${t.score}/25</div>
+        </div>
+
+        <div class="scan-card-body">
+          <div class="scan-gauges">
+            ${gauge}
+            <div class="scan-gauge-label">Score</div>
+            ${pop}
+            <div class="scan-gauge-label">PoP est.</div>
+          </div>
+          <div>
+            <div class="scan-metrics">
+              <div>
+                <div class="scan-metric-label">Trade</div>
+                <div class="scan-metric-val" style="font-size:11px">BUY ${t.contracts}x&nbsp;$${t.strike.toFixed(0)}&nbsp;${t.contract_type.toUpperCase()}</div>
+              </div>
+              <div>
+                <div class="scan-metric-label">Expiry / DTE</div>
+                <div class="scan-metric-val" style="font-size:11px">${t.expiry} <span style="color:var(--faint)">${t.dte}d</span></div>
+              </div>
+              <div>
+                <div class="scan-metric-label">Ask · Size</div>
+                <div class="scan-metric-val" style="color:var(--blue)">$${t.ask.toFixed(2)} <span style="color:var(--faint);font-size:10px">· $${t.position_size_usd.toFixed(0)}</span></div>
+              </div>
+              <div>
+                <div class="scan-metric-label">Max Loss</div>
+                <div class="scan-metric-val" style="color:var(--red)">$${t.max_loss.toFixed(0)}</div>
+              </div>
+              <div>
+                <div class="scan-metric-label">Target Exit</div>
+                <div class="scan-metric-val" style="color:var(--green);font-size:11px">$${t.target_low.toFixed(2)}–$${t.target_high.toFixed(2)}</div>
+              </div>
+              <div>
+                <div class="scan-metric-label">Exp. Value</div>
+                <div class="scan-metric-val" style="color:${evColor}">${evSign}$${t.expected_value.toFixed(0)}</div>
+              </div>
+            </div>
+            <div class="scan-tech-row">
+              <div class="scan-tech-chip">Trend&nbsp;<span class="scan-tech-chip-val" style="color:${techCol}">${t.tech.trend}</span></div>
+              <div class="scan-tech-chip">RSI&nbsp;<span class="scan-tech-chip-val" style="color:${rsiCol}">${t.tech.rsi}</span></div>
+              <div class="scan-tech-chip">Vol&nbsp;<span class="scan-tech-chip-val">${t.tech.volume_ratio}x</span></div>
+              <div class="scan-tech-chip">BB&nbsp;<span class="scan-tech-chip-val">${t.tech.bb_width_pct}%</span></div>
+              ${t.tech.squeeze ? '<div class="scan-tech-chip" style="color:var(--yellow)">⚡ Squeeze</div>' : ''}
+            </div>
+          </div>
+        </div>
+
+        <div class="scan-breakdown">
+          <div class="scan-breakdown-title">Score Breakdown — 5 Factors</div>
+          ${factorRows}
+        </div>
+
+        ${noTrade ? `<div class="scan-notrade-banner">⚠ NO TRADE — ${t.no_trade_reason}</div>` : ''}
+
+        ${(whyHtml || riskHtml) ? `
+        <div class="scan-footer">
+          ${whyHtml ? `<div style="margin-bottom:${riskHtml ? '6px' : '0'}">${whyHtml}</div>` : ''}
+          ${riskHtml}
+        </div>` : ''}
+      </div>`;
+    }).join('');
+
+    const tradeable = trades.filter(t => !t.no_trade_reason).length;
+    el.innerHTML = `<div style="animation:fadeUp 0.2s ease">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap">
+        <div style="font-size:13px;font-weight:700">${trades.length} setup${trades.length !== 1 ? 's' : ''} found</div>
+        <div style="font-size:11px;color:var(--green);font-weight:700">${tradeable} tradeable</div>
+        <div style="font-size:11px;color:var(--faint);margin-left:auto">VIX ${data.vix}</div>
+      </div>
+      ${cards}
+    </div>`;
   }
 
   // ── Ticker input ───────────────────────────────────────────────────────────
@@ -1728,6 +2363,18 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/api/chart":
             ticker = qs.get("t", ["SPY"])[0].upper()[:6]
             self._send_text(_run(["chart", ticker]))
+
+        # ── API: market news (Polygon /v2/reference/news) ──
+        elif path == "/api/news":
+            raw_tickers = qs.get("t", [])
+            ticker_list = [t.upper()[:6] for t in raw_tickers if t] or None
+            data = _fetch_news(ticker_list)
+            self._send(200, "application/json", json.dumps(data).encode())
+
+        # ── API: scan-json (structured scan results for visual cards) ──
+        elif path == "/api/scan-json":
+            data = _fetch_scan_json()
+            self._send(200, "application/json", json.dumps(data).encode())
 
         # ── API: signal analysis (signals engine + chart data) ──
         elif path == "/api/signals":
