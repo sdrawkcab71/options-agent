@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(claude mcp:*)",
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(json.dumps\\(d, indent=2\\)\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(node -e \":*)",
+      "Bash(node -e \"const d = JSON.parse\\(require\\(''fs''\\).readFileSync\\(''C:\\\\\\\\Users\\\\\\\\brian\\\\\\\\.claude.json'', ''utf8''\\)\\); const proj = d.projects[''C:/Users/brian/Vibe Coding/experiments/options-agent''] || {}; console.log\\(JSON.stringify\\(proj.mcpServers || {}, null, 2\\)\\);\")",
+      "Bash(pip install:*)",
+      "Bash(py --version)",
+      "Bash(python3 -m pip --version)",
+      "Bash(py -3 --version)",
+      "Bash(py -3 -m pip --version)",
+      "Bash(ls /c/Python*)",
+      "Bash(where python.exe)",
+      "Bash(\"/c/Users/brian/AppData/Local/Microsoft/WindowsApps/python.exe\" --version)",
+      "Bash(where conda:*)",
+      "Bash(where python3.exe)",
+      "Bash(python -m pip --version)",
+      "Bash(python -m pip install -r requirements.txt)",
+      "Bash(python agent.py pulse)",
+      "Bash(python agent.py chart AAPL)",
+      "Bash(python agent.py flow NVDA)",
+      "Bash(python agent.py scan)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(dir /b)",
+      "mcp__github__get_me",
+      "mcp__github__create_repository",
+      "mcp__github__list_branches",
+      "mcp__github__list_commits",
+      "Bash(\"C:/Users/brian/Vibe Coding/experiments/options-agent/Procfile\")",
+      "Bash(\"C:/Users/brian/Vibe Coding/experiments/options-agent/runtime.txt\")",
+      "Bash(\"C:/Users/brian/Vibe Coding/experiments/options-agent/railway.toml\":*)",
+      "Bash(python -c \"import ast, sys; ast.parse\\(open\\(''server.py''\\).read\\(\\)\\); print\\(''server.py syntax OK''\\)\")",
+      "Bash(python -c \"import ast, sys; ast.parse\\(open\\(''src/signals.py''\\).read\\(\\)\\); print\\(''signals.py syntax OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''server.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''server.py syntax OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/signals.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''signals.py syntax OK''\\)\")"
+    ]
+  }
+}
