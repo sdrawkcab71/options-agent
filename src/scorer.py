@@ -1,238 +1,178 @@
 """
-Step 4 — Trade Scoring & Position Sizing.
-
-Scores each TradeSetup on 5 factors (max 5 each = 25 total).
-Applies non-negotiable sizing rules from account config.
+Spread Scorer — conviction scoring for credit spreads and iron condors.
+Max 25 points across 5 factors.
 """
+from dataclasses import dataclass, field
+from typing import Union
 
-from dataclasses import dataclass
-
-from src.scanner import TradeSetup
-from src.config import (
-    CAPITAL, MAX_SINGLE_TRADE_PCT, MIN_SCORE_TO_TRADE,
-    SMALL_TRADE_SCORE_MAX, SMALL_TRADE_PCT, STANDARD_TRADE_PCT,
-    VIX_ELEVATED,
-)
+from src.market_classifier import MarketVerdict
+from src.spread_builder import CreditSpread
+from src.condor_builder import IronCondor
+_MIN_SCORE_TO_TRADE = 15
+_SMALL_TRADE_SCORE_MAX = 19
 
 
 @dataclass
-class ScoredTrade:
-    """A TradeSetup with a computed conviction score and sizing."""
-    setup: TradeSetup
-    score: int
+class ScoredSpread:
+    trade: Union[CreditSpread, IronCondor]
+    score: int                          # 0–25
     score_breakdown: dict[str, int]
-    position_size_usd: float
-    position_size_contracts: int
-    pop_estimate: float    # probability of profit (rough)
-    expected_value: float
-    why: list[str]
-    risk_flags: list[str]
-    no_trade_reason: str   # non-empty if score < threshold
+    verdict: str                        # "STRONG TRADE" | "ACCEPTABLE" | "WEAK" | "NO TRADE"
+    why: list[str] = field(default_factory=list)
+    risk_flags: list[str] = field(default_factory=list)
+    no_trade_reason: str = ""
+    size_recommendation: str = ""
 
 
-# ── Scoring helpers ───────────────────────────────────────────────────────────
-
-def _score_flow_conviction(setup: TradeSetup) -> tuple[int, str]:
-    """Score 1–5 based on vol/OI ratio and estimated premium."""
-    ratio = setup.flow.vol_oi_ratio
-    premium = setup.flow.estimated_premium
-    if ratio >= 10 and premium >= 200_000:
-        return 5, f"Vol/OI {ratio}x with ${premium:,.0f} estimated premium (very strong)"
-    if ratio >= 7 or premium >= 150_000:
-        return 4, f"Vol/OI {ratio}x, ${premium:,.0f} premium (strong flow)"
-    if ratio >= 5 or premium >= 100_000:
-        return 3, f"Vol/OI {ratio}x, ${premium:,.0f} premium (moderate flow)"
-    if ratio >= 3:
-        return 2, f"Vol/OI {ratio}x (minimum threshold met)"
-    return 1, f"Vol/OI {ratio}x (weak flow)"
+def _score_market_verdict(verdict: MarketVerdict) -> tuple[int, str]:
+    """Factor 1: Market classifier (max 5)."""
+    scores = {"GREEN": 5, "YELLOW": 3, "RED": 0}
+    s = scores.get(verdict.signal, 0)
+    why = f"Market {verdict.signal}: {verdict.reasons[0] if verdict.reasons else ''}"
+    return s, why
 
 
-def _score_technical_alignment(setup: TradeSetup) -> tuple[int, str]:
-    """Score 1–5: how cleanly do technicals support the trade direction."""
-    tech = setup.tech
-    score = 0
-    reasons: list[str] = []
+def _score_strike_probability(trade: Union[CreditSpread, IronCondor]) -> tuple[int, str]:
+    """Factor 2: Win probability from delta (max 5)."""
+    if isinstance(trade, IronCondor):
+        # Use worst (lower) of the two sides
+        pop = min(trade.put_spread.pop, trade.call_spread.pop)
+    else:
+        pop = trade.pop
 
-    if tech.trend != "NEUTRAL":
-        score += 2
-        reasons.append(f"Trend {tech.trend}")
-
-    if tech.momentum == "OVERSOLD" and tech.direction == "BULLISH":
-        score += 2
-        reasons.append("RSI oversold (mean-reversion setup)")
-    elif tech.momentum == "OVERBOUGHT" and tech.direction == "BEARISH":
-        score += 2
-        reasons.append("RSI overbought (reversal setup)")
-    elif tech.momentum == "NEUTRAL":
-        score += 1
-        reasons.append("RSI neutral")
-
-    if tech.volume_signal == "HIGH":
-        score += 1
-        reasons.append("Volume confirming (>1.5x avg)")
-
-    score = min(score, 5)
-    return score, " | ".join(reasons) if reasons else "Weak technical confirmation"
+    if pop >= 90:
+        s, label = 5, f"PoP {pop:.0f}% — excellent (0.10Δ)"
+    elif pop >= 85:
+        s, label = 4, f"PoP {pop:.0f}% — strong (0.15Δ)"
+    elif pop >= 80:
+        s, label = 3, f"PoP {pop:.0f}% — acceptable (0.20Δ)"
+    else:
+        s, label = 0, f"PoP {pop:.0f}% — below minimum 80%"
+    return s, label
 
 
-def _score_risk_reward(setup: TradeSetup) -> tuple[int, str]:
-    """Score 1–5: potential gain vs max loss (want at least 1:2)."""
-    ask = setup.flow.ask
-    if ask <= 0:
-        return 1, "Cannot calculate R/R (invalid ask)"
-    max_loss = ask * 100
-    target_gain = (setup.target_high - ask) * 100
-    rr = target_gain / max_loss if max_loss > 0 else 0
-
-    if rr >= 2.0:
-        return 5, f"R/R {rr:.1f}:1 (excellent)"
-    if rr >= 1.5:
-        return 4, f"R/R {rr:.1f}:1 (good)"
-    if rr >= 1.0:
-        return 3, f"R/R {rr:.1f}:1 (acceptable)"
-    if rr >= 0.5:
-        return 2, f"R/R {rr:.1f}:1 (below target)"
-    return 1, f"R/R {rr:.1f}:1 (poor — skip)"
+def _score_iv_edge(verdict: MarketVerdict) -> tuple[int, str]:
+    """Factor 3: IV vs realized vol edge (max 5)."""
+    edge_pct = verdict.iv_edge * 100
+    if edge_pct >= 5:
+        s, why = 5, f"IV-RV edge +{edge_pct:.1f}% — strong seller environment"
+    elif edge_pct >= 2:
+        s, why = 4, f"IV-RV edge +{edge_pct:.1f}% — good seller edge"
+    elif edge_pct > 0:
+        s, why = 3, f"IV-RV edge +{edge_pct:.1f}% — marginal edge"
+    elif edge_pct > -2:
+        s, why = 2, f"IV-RV edge {edge_pct:.1f}% — no edge but not extreme"
+    else:
+        s, why = 1, f"IV-RV edge {edge_pct:.1f}% — unfavorable for sellers"
+    return s, why
 
 
-def _score_iv_environment(setup: TradeSetup, vix: float) -> tuple[int, str]:
-    """Score 1–5: IV relative to environment. Low IV = better for buying."""
-    iv = setup.flow.iv * 100  # convert to percentage
-    if iv < 25 and vix < VIX_ELEVATED:
-        return 5, f"IV {iv:.0f}% is low — cheap premium (ideal for buying)"
-    if iv < 35 and vix < VIX_ELEVATED:
-        return 4, f"IV {iv:.0f}% is moderate — fair premium"
-    if iv < 50:
-        return 3, f"IV {iv:.0f}% is elevated — premium is pricey"
-    if iv < 70:
-        return 2, f"IV {iv:.0f}% is high — watch for IV crush"
-    return 1, f"IV {iv:.0f}% is very high — strong IV crush risk"
+def _score_credit_quality(trade: Union[CreditSpread, IronCondor]) -> tuple[int, str]:
+    """Factor 4: Credit as % of spread width — want > 20% (max 5)."""
+    if isinstance(trade, IronCondor):
+        credit = trade.total_credit
+        width = max(trade.put_spread.spread_width, trade.call_spread.spread_width)
+    else:
+        credit = trade.credit
+        width = trade.spread_width
+
+    credit_pct = (credit / width * 100) if width > 0 else 0
+
+    if credit_pct >= 30:
+        s, why = 5, f"Credit {credit:.2f} = {credit_pct:.0f}% of width — excellent"
+    elif credit_pct >= 25:
+        s, why = 4, f"Credit {credit:.2f} = {credit_pct:.0f}% of width — good"
+    elif credit_pct >= 20:
+        s, why = 3, f"Credit {credit:.2f} = {credit_pct:.0f}% of width — acceptable"
+    elif credit_pct >= 15:
+        s, why = 2, f"Credit {credit:.2f} = {credit_pct:.0f}% of width — marginal"
+    else:
+        s, why = 0, f"Credit {credit:.2f} = {credit_pct:.0f}% of width — too low"
+    return s, why
 
 
-def _score_catalyst(setup: TradeSetup) -> tuple[int, str]:
-    """
-    Score 1–5 for known upcoming catalysts.
-
-    Without a live catalyst feed we approximate from IV and DTE:
-    high IV + near expiry often implies the market is pricing a catalyst.
-    """
-    iv = setup.flow.iv * 100
-    dte = setup.flow.dte
-    # High IV on a short-dated contract often means catalyst is expected
-    if iv > 50 and dte <= 14:
-        return 4, "Elevated IV implies potential catalyst within expiry window"
-    if iv > 35 and dte <= 14:
-        return 3, "Moderate IV suggests possible catalyst"
-    if dte <= 10:
-        return 2, "Short DTE — limited time for catalyst to materialize"
-    return 1, "No obvious catalyst signal identified"
+def _score_dte(trade: Union[CreditSpread, IronCondor]) -> tuple[int, str]:
+    """Factor 5: DTE sweet spot for theta decay (max 5)."""
+    dte = trade.dte
+    if 10 <= dte <= 21:
+        s, why = 5, f"DTE {dte} — sweet spot for theta decay"
+    elif 7 <= dte < 10:
+        s, why = 4, f"DTE {dte} — short but still good theta"
+    elif 21 < dte <= 35:
+        s, why = 3, f"DTE {dte} — longer expiry, slower theta"
+    elif 5 <= dte < 7:
+        s, why = 2, f"DTE {dte} — very short, gamma accelerating"
+    else:
+        s, why = 1, f"DTE {dte} — outside optimal theta window"
+    return s, why
 
 
-# ── Main scoring function ─────────────────────────────────────────────────────
+def _risk_flags(trade: Union[CreditSpread, IronCondor], verdict: MarketVerdict) -> list[str]:
+    flags = []
+    if verdict.vix >= 25:
+        flags.append(f"VIX {verdict.vix:.1f} — elevated, use spreads not naked options")
+    if verdict.gap_risk == "HIGH":
+        flags.append("Overnight gap risk HIGH — consider reducing size")
+    if trade.dte <= 7:
+        flags.append(f"DTE {trade.dte} — gamma acceleration zone")
+    if verdict.event_density >= 2:
+        flags.append(f"{verdict.event_density} macro events this week — elevated pin risk")
+    return flags
 
-def score_trade(setup: TradeSetup, vix: float = 15.0) -> ScoredTrade:
-    """
-    Score a TradeSetup and compute sizing, PoP, and EV.
 
-    Args:
-        setup: A confirmed TradeSetup from the scanner.
-        vix: Current VIX level (used for IV environment scoring).
+def score_trade(
+    trade: Union[CreditSpread, IronCondor],
+    verdict: MarketVerdict,
+) -> ScoredSpread:
+    factors: dict[str, int] = {}
+    why: list[str] = []
 
-    Returns:
-        ScoredTrade with all fields populated.
-    """
-    f1, why1 = _score_flow_conviction(setup)
-    f2, why2 = _score_technical_alignment(setup)
-    f3, why3 = _score_risk_reward(setup)
-    f4, why4 = _score_iv_environment(setup, vix)
-    f5, why5 = _score_catalyst(setup)
+    s1, w1 = _score_market_verdict(verdict)
+    s2, w2 = _score_strike_probability(trade)
+    s3, w3 = _score_iv_edge(verdict)
+    s4, w4 = _score_credit_quality(trade)
+    s5, w5 = _score_dte(trade)
 
-    total = f1 + f2 + f3 + f4 + f5
-    breakdown = {
-        "Flow Conviction": f1,
-        "Technical Alignment": f2,
-        "Risk/Reward": f3,
-        "IV Environment": f4,
-        "Catalyst": f5,
+    factors = {
+        "Market Verdict": s1,
+        "Strike Probability": s2,
+        "IV Edge": s3,
+        "Credit Quality": s4,
+        "DTE Optimization": s5,
     }
-    why = [why1, why2, why3, why4, why5]
-    risk_flags: list[str] = []
+    why = [w1, w2, w3, w4, w5]
+    total = sum(factors.values())
 
-    if setup.flow.iv * 100 > 60:
-        risk_flags.append(f"Very high IV ({setup.flow.iv*100:.0f}%) — premium decay risk")
-    if vix > VIX_ELEVATED:
-        risk_flags.append("VIX > 25 — consider a spread instead of naked long")
-    if setup.flow.spread > 0.15:
-        risk_flags.append(f"Bid/ask spread ${setup.flow.spread:.2f} — liquidity concern")
-    if setup.flow.dte <= 8:
-        risk_flags.append(f"Only {setup.flow.dte} DTE — theta decay accelerating")
+    flags = _risk_flags(trade, verdict)
 
-    # Sizing
+    if total >= 20:
+        trade_verdict = "STRONG TRADE"
+        size = "Standard size: 3–5% account risk"
+    elif total >= 15:
+        trade_verdict = "ACCEPTABLE"
+        size = "Small size: 2–3% account risk"
+    elif total >= 10:
+        trade_verdict = "WEAK"
+        size = "Very small or skip"
+    else:
+        trade_verdict = "NO TRADE"
+        size = ""
+
     no_trade_reason = ""
-    if total < MIN_SCORE_TO_TRADE:
-        no_trade_reason = f"Score {total}/25 below minimum threshold of {MIN_SCORE_TO_TRADE}"
-        position_usd = 0.0
-    elif total <= SMALL_TRADE_SCORE_MAX:
-        position_usd = round(CAPITAL * SMALL_TRADE_PCT, 0)
-    else:
-        position_usd = round(CAPITAL * STANDARD_TRADE_PCT, 0)
+    if total < _MIN_SCORE_TO_TRADE or verdict.signal == "RED":
+        trade_verdict = "NO TRADE"
+        no_trade_reason = (
+            "RED market conditions" if verdict.signal == "RED"
+            else f"Score {total}/25 below minimum {_MIN_SCORE_TO_TRADE}"
+        )
 
-    position_usd = min(position_usd, CAPITAL * MAX_SINGLE_TRADE_PCT)
-    contract_cost = setup.flow.ask * 100
-    contracts = max(1, int(position_usd // contract_cost)) if contract_cost > 0 else 0
-
-    # Probability of profit: use delta as rough ITM probability proxy
-    pop = round(setup.flow.delta * 100, 1)
-
-    # Expected value: (PoP × target midpoint gain) – ((1-PoP) × max loss)
-    target_mid = (setup.target_low + setup.target_high) / 2
-    gain_per_contract = (target_mid - setup.flow.ask) * 100
-    loss_per_contract = setup.flow.ask * 100
-    ev = round(
-        (pop / 100 * gain_per_contract * contracts)
-        - ((1 - pop / 100) * loss_per_contract * contracts),
-        0,
-    )
-
-    return ScoredTrade(
-        setup=setup,
+    return ScoredSpread(
+        trade=trade,
         score=total,
-        score_breakdown=breakdown,
-        position_size_usd=position_usd,
-        position_size_contracts=contracts,
-        pop_estimate=pop,
-        expected_value=ev,
+        score_breakdown=factors,
+        verdict=trade_verdict,
         why=why,
-        risk_flags=risk_flags,
+        risk_flags=flags,
         no_trade_reason=no_trade_reason,
+        size_recommendation=size,
     )
-
-
-def calculate_size(ticker: str, score: int) -> dict[str, object]:
-    """
-    Quick position size lookup without a full trade setup.
-
-    Args:
-        ticker: For display purposes.
-        score: Signal score 1–25.
-
-    Returns:
-        Dict with size_usd, size_pct, and verdict string.
-    """
-    if score < MIN_SCORE_TO_TRADE:
-        return {
-            "ticker": ticker, "score": score,
-            "verdict": f"NO TRADE — score {score} < {MIN_SCORE_TO_TRADE}",
-            "size_usd": 0, "size_pct": 0,
-        }
-    if score <= SMALL_TRADE_SCORE_MAX:
-        pct = SMALL_TRADE_PCT
-    else:
-        pct = STANDARD_TRADE_PCT
-    usd = min(CAPITAL * pct, CAPITAL * MAX_SINGLE_TRADE_PCT)
-    return {
-        "ticker": ticker, "score": score,
-        "verdict": "TRADE",
-        "size_usd": round(usd, 0),
-        "size_pct": round(pct * 100, 1),
-    }

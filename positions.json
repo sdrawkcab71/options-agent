@@ -1,12 +1,26 @@
 [
   {
-    "_comment": "Edit this file to track your open positions. Delete this example entry.",
-    "ticker": "AAPL",
-    "option_ticker": "O:AAPL250321C00175000",
-    "strike": 175.0,
-    "expiry": "2025-03-21",
-    "contract_type": "call",
+    "_comment": "Edit this file to track open spread/condor positions. Delete this example entry.",
+    "id": "ic_example_001",
+    "type": "iron_condor",
+    "underlying": "SPX",
+    "put_short_strike": 5100,
+    "put_long_strike": 5095,
+    "call_short_strike": 5300,
+    "call_long_strike": 5305,
+    "expiry": "2026-05-16",
+    "dte_at_entry": 8,
     "contracts": 1,
-    "entry_price": 2.50
+    "credit_received": 1.50,
+    "max_loss_usd": 350.00,
+    "entry_date": "2026-05-08",
+    "goal_profile": "MODERATE",
+    "status": "open",
+    "legs": [
+      {"role": "short", "contract_type": "put", "strike": 5100, "option_ticker": "O:SPX260516P05100000", "delta_at_entry": -0.15},
+      {"role": "long",  "contract_type": "put", "strike": 5095, "option_ticker": "O:SPX260516P05095000", "delta_at_entry": -0.10},
+      {"role": "short", "contract_type": "call", "strike": 5300, "option_ticker": "O:SPX260516C05300000", "delta_at_entry": 0.15},
+      {"role": "long",  "contract_type": "call", "strike": 5305, "option_ticker": "O:SPX260516C05305000", "delta_at_entry": 0.10}
+    ]
   }
 ]

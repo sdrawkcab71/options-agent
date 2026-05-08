@@ -1,239 +1,232 @@
 """
-Step 6 — Active Position Monitor.
-
-Loads open positions from positions.json, fetches current option prices,
-and applies exit rules: +75% take profit, -50% stop loss, <3 DTE time stop.
+Position Monitor — multi-leg spread and condor monitoring with exit rules.
 """
-
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Optional
 
-from rich.panel import Panel
+from src.config import STOP_LOSS_MULTIPLIER, PROFIT_TARGET_PCT, GAMMA_RISK_DTE
+from src.massive_client import MassiveClient
 
-from src.output import console
-from src.polygon import PolygonClient
-
-POSITIONS_FILE = Path("positions.json")
+_POSITIONS_FILE = Path("positions.json")
 
 
 @dataclass
-class Position:
-    """A single open options position."""
-    ticker: str
-    option_ticker: str
-    strike: float
+class SpreadStatus:
+    position_id: str
+    strategy: str
+    underlying: str
     expiry: str
-    contract_type: str
-    contracts: int
-    entry_price: float
-
-
-@dataclass
-class PositionStatus:
-    """Current status of an open position with exit recommendation."""
-    position: Position
-    current_price: Optional[float]
-    pnl_pct: Optional[float]
-    pnl_usd: Optional[float]
     dte: int
-    action: str       # HOLD / TAKE PROFIT / STOP OUT / ROLL / EXIT (time stop)
+    credit_received: float
+    current_value: Optional[float]  # current cost to close spread (buy it back)
+    pnl_pct: Optional[float]        # % of credit captured
+    pnl_usd: Optional[float]
+    action: str                     # "HOLD" | "TAKE PROFIT" | "STOP OUT" | "ADJUST" | "EXPIRED" | "UNKNOWN"
     reason: str
+    in_gamma_zone: bool
+    adjustment_needed: bool
+    contracts: int = 1
+    underlying_price: Optional[float] = None
+    notes: list[str] = field(default_factory=list)
 
 
-def _load_positions() -> list[Position]:
-    """
-    Load positions from positions.json.
-
-    Returns:
-        List of Position objects. Returns empty list if file not found.
-    """
-    if not POSITIONS_FILE.exists():
-        return []
+def _dte(expiry: str) -> int:
     try:
-        raw = json.loads(POSITIONS_FILE.read_text())
-        positions: list[Position] = []
-        for item in raw:
-            if "_comment" in item:
-                continue
-            positions.append(Position(
-                ticker=item["ticker"],
-                option_ticker=item.get("option_ticker", ""),
-                strike=float(item["strike"]),
-                expiry=item["expiry"],
-                contract_type=item["contract_type"],
-                contracts=int(item.get("contracts", 1)),
-                entry_price=float(item["entry_price"]),
-            ))
-        return positions
-    except (json.JSONDecodeError, KeyError) as exc:
-        console.print(f"[red]Error reading positions.json: {exc}[/red]")
-        return []
+        return max(0, (date.fromisoformat(expiry) - date.today()).days)
+    except Exception:
+        return -1
 
 
-def _fetch_current_price(client: PolygonClient, pos: Position) -> Optional[float]:
-    """
-    Attempt to fetch the current mid-price for an open option contract.
+def _fetch_spread_current_value(
+    position: dict,
+    client: MassiveClient,
+    underlying_price: Optional[float] = None,
+) -> Optional[float]:
+    """Fetch current mid-price net value of all legs (cost to close)."""
+    legs = position.get("legs", [])
+    if not legs:
+        return None
 
-    Tries the underlying options chain and matches by strike/expiry.
-    Returns None if data is unavailable.
-    """
-    try:
-        from datetime import date as d
-        today = d.today()
-        chain = client.options_chain(
-            pos.ticker,
-            min_expiry=pos.expiry,
-            max_expiry=pos.expiry,
-        )
-        for contract in chain.get("results", []):
-            details = contract.get("details", {})
-            if (
-                abs(float(details.get("strike_price", 0)) - pos.strike) < 0.01
-                and details.get("contract_type", "") == pos.contract_type
-            ):
-                quote = contract.get("last_quote", {})
-                bid = float(quote.get("bid") or 0)
-                ask = float(quote.get("ask") or 0)
-                if bid > 0 and ask > 0:
-                    return round((bid + ask) / 2, 2)
-    except RuntimeError:
-        pass
-    return None
-
-
-def _determine_action(pos: Position, current_price: Optional[float], dte: int) -> tuple[str, str]:
-    """
-    Apply exit rules and return (action, reason).
-
-    Rules (in priority order):
-    1. Time stop: < 3 DTE and not profitable → EXIT
-    2. Take profit: current ≥ entry × 1.75
-    3. Stop loss: current ≤ entry × 0.50
-    4. Otherwise: HOLD
-    """
-    if dte < 0:
-        return "EXPIRED", "Position has expired"
-
-    if current_price is None:
-        return "HOLD", "Could not fetch current price — check manually"
-
-    ratio = current_price / pos.entry_price if pos.entry_price > 0 else 1.0
-
-    if dte < 3:
-        if ratio <= 1.0:
-            return "EXIT", f"Time stop: {dte} DTE remaining and position not profitable"
-        else:
-            return "ROLL", f"{dte} DTE remaining — consider rolling to later expiry"
-
-    if ratio >= 1.75:
-        return "TAKE PROFIT", f"Up {(ratio-1)*100:.0f}% — at or beyond +75% target"
-
-    if ratio <= 0.50:
-        return "STOP OUT", f"Down {(1-ratio)*100:.0f}% — hit –50% stop loss"
-
-    return "HOLD", f"P&L {(ratio-1)*100:+.0f}% — within normal range, hold"
-
-
-def check_positions(api_key: str) -> list[PositionStatus]:
-    """
-    Load all positions and evaluate their current status.
-
-    Args:
-        api_key: Polygon.io API key.
-
-    Returns:
-        List of PositionStatus objects.
-    """
-    positions = _load_positions()
-    if not positions:
-        return []
-
-    client = PolygonClient(api_key)
-    statuses: list[PositionStatus] = []
-    today = date.today()
-
-    for pos in positions:
+    total = 0.0
+    for leg in legs:
+        ticker = leg.get("option_ticker", "")
+        if not ticker:
+            continue
         try:
-            expiry_date = date.fromisoformat(pos.expiry)
-            dte = (expiry_date - today).days
-        except ValueError:
-            dte = -1
+            snap = client.option_contract_snapshot(ticker)
+            quote = snap.get("last_quote", {})
+            bid = float(quote.get("bid", 0))
+            ask = float(quote.get("ask", 0))
+            if bid and ask:
+                mid = (bid + ask) / 2.0
+            elif snap.get("day", {}).get("close"):
+                mid = float(snap["day"]["close"])
+            else:
+                continue
+            # Short legs add value when you buy to close (costs money)
+            # Long legs credit value when you sell to close
+            role = leg.get("role", "short")
+            sign = 1.0 if role == "short" else -1.0
+            total += sign * mid
+        except Exception:
+            continue
 
-        current = _fetch_current_price(client, pos)
+    return round(total, 2) if total != 0.0 else None
+
+
+def _determine_action(
+    position: dict,
+    current_value: Optional[float],
+    dte: int,
+    underlying_price: Optional[float] = None,
+) -> tuple[str, str, bool, bool]:
+    """Returns (action, reason, adjustment_needed, in_gamma_zone)."""
+    credit = float(position.get("credit_received", 0))
+    in_gamma = dte <= GAMMA_RISK_DTE
+
+    if dte < 0:
+        return "EXPIRED", "Position expired", False, False
+
+    if current_value is None:
+        return "UNKNOWN", "Cannot fetch current price", False, in_gamma
+
+    stop_loss_threshold = credit * STOP_LOSS_MULTIPLIER
+    profit_target_threshold = credit * PROFIT_TARGET_PCT
+
+    # DTE < 3 time stop
+    if dte <= 2:
+        if current_value <= profit_target_threshold:
+            return "TAKE PROFIT", f"DTE {dte} — close profitably before expiry", False, in_gamma
+        return "ROLL", f"DTE {dte} — roll to avoid assignment / gamma risk", False, in_gamma
+
+    if current_value >= stop_loss_threshold:
+        return (
+            "STOP OUT",
+            f"Spread value ${current_value:.2f} hit 2× credit (${stop_loss_threshold:.2f})",
+            False,
+            in_gamma,
+        )
+
+    if current_value <= profit_target_threshold:
+        return (
+            "TAKE PROFIT",
+            f"50% profit target hit (current ${current_value:.2f} ≤ ${profit_target_threshold:.2f})",
+            False,
+            in_gamma,
+        )
+
+    # Adjustment check
+    adjustment_needed = False
+    adj_reason = ""
+    if underlying_price:
+        put_short = position.get("put_short_strike") or position.get("short_strike")
+        call_short = position.get("call_short_strike")
+        if put_short:
+            distance = underlying_price - float(put_short)
+            spread_width = abs(float(position.get("put_short_strike", 0)) - float(position.get("put_long_strike", 0) or 0)) or 5.0
+            if distance < spread_width * 1.5:
+                adjustment_needed = True
+                adj_reason = f"Price ${underlying_price:.0f} approaching put spread (short ${put_short})"
+        if call_short and not adjustment_needed:
+            distance = float(call_short) - underlying_price
+            spread_width = abs(float(position.get("call_short_strike", 0)) - float(position.get("call_long_strike", 0) or 0)) or 5.0
+            if distance < spread_width * 1.5:
+                adjustment_needed = True
+                adj_reason = f"Price ${underlying_price:.0f} approaching call spread (short ${call_short})"
+
+    if adjustment_needed:
+        return "ADJUST", adj_reason, True, in_gamma
+
+    return "HOLD", f"Within profit zone — DTE {dte}, value ${current_value:.2f}", False, in_gamma
+
+
+def check_spread_positions(api_key: str) -> list[SpreadStatus]:
+    if not _POSITIONS_FILE.exists():
+        return []
+
+    try:
+        raw = json.loads(_POSITIONS_FILE.read_text())
+    except Exception:
+        return []
+
+    client = MassiveClient(api_key)
+    statuses: list[SpreadStatus] = []
+
+    for pos in raw:
+        if not isinstance(pos, dict) or pos.get("_comment"):
+            continue
+        if pos.get("status") not in ("open", None):
+            continue
+
+        pos_id = pos.get("id", "unknown")
+        strategy = pos.get("type", pos.get("strategy", "spread"))
+        underlying = pos.get("underlying", "SPX")
+        expiry = pos.get("expiry", "")
+        dte = _dte(expiry)
+        credit = float(pos.get("credit_received", 0))
+        contracts = int(pos.get("contracts", 1))
+
+        # Try to get underlying price
+        underlying_price: Optional[float] = None
+        try:
+            snap = client.stock_snapshot(underlying)
+            day = snap.get("day", {})
+            underlying_price = float(day.get("c") or snap.get("lastTrade", {}).get("p", 0) or 0)
+        except Exception:
+            pass
+
+        current_val = _fetch_spread_current_value(pos, client, underlying_price)
+
+        # P&L
         pnl_pct: Optional[float] = None
         pnl_usd: Optional[float] = None
-        if current is not None and pos.entry_price > 0:
-            pnl_pct = round((current / pos.entry_price - 1) * 100, 1)
-            pnl_usd = round((current - pos.entry_price) * 100 * pos.contracts, 0)
+        if current_val is not None and credit > 0:
+            pnl_pct = round((credit - current_val) / credit * 100, 1)
+            pnl_usd = round((credit - current_val) * contracts * 100, 2)
 
-        action, reason = _determine_action(pos, current, dte)
-        statuses.append(PositionStatus(
-            position=pos,
-            current_price=current,
+        action, reason, adjustment_needed, in_gamma = _determine_action(
+            pos, current_val, dte, underlying_price
+        )
+
+        statuses.append(SpreadStatus(
+            position_id=pos_id,
+            strategy=strategy,
+            underlying=underlying,
+            expiry=expiry,
+            dte=dte,
+            credit_received=credit,
+            current_value=current_val,
             pnl_pct=pnl_pct,
             pnl_usd=pnl_usd,
-            dte=dte,
             action=action,
             reason=reason,
+            in_gamma_zone=in_gamma,
+            adjustment_needed=adjustment_needed,
+            contracts=contracts,
+            underlying_price=underlying_price,
         ))
 
     return statuses
 
 
-def display_positions(statuses: list[PositionStatus]) -> None:
-    """Print position monitor output to the terminal."""
-    if not statuses:
-        console.print(
-            Panel(
-                "[yellow]No open positions found.[/yellow]\n\n"
-                "Edit [bold]positions.json[/bold] to add your open trades.\n"
-                "Format: ticker, option_ticker, strike, expiry, contract_type, contracts, entry_price",
-                title="Position Monitor",
-                border_style="yellow",
-            )
-        )
-        return
-
-    console.rule("[bold cyan]OPEN POSITIONS[/bold cyan]")
-    for ps in statuses:
-        pos = ps.position
-        action_colors = {
-            "HOLD": "green", "TAKE PROFIT": "bright_green",
-            "STOP OUT": "red", "EXIT": "red", "ROLL": "yellow",
-            "EXPIRED": "dim", "TAKE PROFIT": "bright_green",
-        }
-        color = action_colors.get(ps.action, "white")
-
-        price_str = f"${ps.current_price:.2f}" if ps.current_price else "N/A"
-        pnl_str = (
-            f"[{'green' if (ps.pnl_pct or 0) >= 0 else 'red'}]"
-            f"{ps.pnl_pct:+.1f}%  (${ps.pnl_usd:+,.0f})[/]"
-            if ps.pnl_pct is not None else "N/A"
-        )
-
-        lines = [
-            f"[bold]{pos.ticker}  ${pos.strike:.0f} {pos.contract_type.upper()}  exp {pos.expiry}[/bold]",
-            f"Entry: ${pos.entry_price:.2f}  |  Current: {price_str}  |  P&L: {pnl_str}",
-            f"DTE: {ps.dte}",
-            f"[bold {color}]>> {ps.action}[/bold {color}]  {ps.reason}",
-        ]
-        console.print(Panel("\n".join(lines), border_style=color, padding=(0, 1)))
+def save_position(position: dict) -> None:
+    existing: list = []
+    if _POSITIONS_FILE.exists():
+        try:
+            existing = json.loads(_POSITIONS_FILE.read_text())
+        except Exception:
+            pass
+    existing.append(position)
+    _POSITIONS_FILE.write_text(json.dumps(existing, indent=2))
 
 
-def check_single_exit(api_key: str, ticker: str) -> None:
-    """
-    Print exit recommendation for a specific ticker's open position.
-
-    Args:
-        api_key: Polygon.io API key.
-        ticker: Ticker symbol to check.
-    """
-    statuses = check_positions(api_key)
-    matches = [s for s in statuses if s.position.ticker.upper() == ticker.upper()]
-    if not matches:
-        console.print(f"[yellow]No open position found for {ticker} in positions.json[/yellow]")
-        return
-    display_positions(matches)
+def load_positions() -> list[dict]:
+    if not _POSITIONS_FILE.exists():
+        return []
+    try:
+        return [p for p in json.loads(_POSITIONS_FILE.read_text()) if not p.get("_comment")]
+    except Exception:
+        return []

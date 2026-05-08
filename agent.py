@@ -1,259 +1,268 @@
 #!/usr/bin/env python3
 """
-Options Research & Signal Agent — CLI entry point.
+Options Agent V2 — CLI entry point.
+Focused on SPX credit spreads and iron condors (premium selling / theta strategy).
 
-Usage:
-    python agent.py scan                  # Full pipeline
-    python agent.py pulse                 # Market pulse only
-    python agent.py flow NVDA             # Flow scan for one ticker
-    python agent.py chart AAPL            # Technical summary
-    python agent.py size TSLA 18          # Position size for a score
-    python agent.py monitor               # Check open positions
-    python agent.py explain MSFT          # Plain English breakdown
-    python agent.py exit AAPL             # Exit recommendation
+Commands:
+  scan              Full pipeline: classify market → find best credit spread
+  pulse             Market pulse + GREEN/YELLOW/RED verdict
+  condor [WEEKLY|MONTHLY]  Build iron condor on best index
+  strikes TICKER    Probability-based strike selection
+  theta             Theta decay analysis for open positions
+  monitor           Check open spread positions
+  size SCORE CREDIT Position sizing calculator
+  goal TARGET DAYS  Goal wizard (e.g. goal 500 30)
 """
-
 import argparse
-import io
 import os
 import sys
 from pathlib import Path
 
-# Force UTF-8 output on Windows so Rich box-drawing characters render correctly.
-# Must happen before any Rich imports.
-if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
-
 from dotenv import load_dotenv
 
-# Load .env.local first, fall back to .env
 load_dotenv(Path(".env.local"))
 load_dotenv(Path(".env"))
 
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
+from src.output import console, print_header
 
 
 def _require_key() -> str:
-    """Exit with a helpful message if the API key is missing."""
-    if not POLYGON_API_KEY:
-        print("ERROR: POLYGON_API_KEY not set. Add it to .env.local")
+    key = os.environ.get("MASSIVE_API_KEY") or os.environ.get("POLYGON_API_KEY", "")
+    if not key:
+        console.print(
+            "[red]Error: MASSIVE_API_KEY not set.[/red]\n"
+            "Add it to .env.local:\n  MASSIVE_API_KEY=your_key_here"
+        )
         sys.exit(1)
-    return POLYGON_API_KEY
+    return key
 
 
 # ── Command handlers ──────────────────────────────────────────────────────────
 
-def cmd_scan(_args: argparse.Namespace) -> None:
-    """Full pipeline: pulse → flow scan → technicals → scored trade cards."""
-    from src.market_pulse import get_market_pulse
-    from src.scanner import run_full_scan
+def cmd_scan(args) -> None:
+    from src.spread_builder import find_best_credit_spread
     from src.scorer import score_trade
-    from src.output import print_header, display_market_pulse, display_trade_card
+    from src.output import display_daily_spread_result, display_scored_trade
 
     key = _require_key()
-    print_header("MARKET PULSE")
+    account = getattr(args, "account", 5000.0)
+
+    print_header("FULL SCAN — SPX Credit Spreads")
+    console.print("[dim]Running: Market Pulse → Classifier → Expected Move → Strike Select → Spread Build...[/dim]\n")
+
+    result = find_best_credit_spread(key, account_size=account)
+    display_daily_spread_result(result)
+
+    if result.put_spread and result.put_spread.passes_filters:
+        scored = score_trade(result.put_spread, result.classifier)
+        display_scored_trade(scored)
+
+
+def cmd_pulse(args) -> None:
+    from src.market_pulse import get_market_pulse
+    from src.market_classifier import classify_market
+    from src.output import display_market_classifier
+
+    key = _require_key()
+    console.print("[dim]Fetching market pulse...[/dim]")
     pulse = get_market_pulse(key)
-    display_market_pulse(pulse)
+    verdict = classify_market(pulse)
 
-    print_header("SCANNING FOR SETUPS")
-    setups = run_full_scan(key)
-
-    if not setups:
-        from src.output import console
-        console.print("[yellow]No confirmed setups found this session.[/yellow]")
-        return
-
-    print_header(f"TRADE SHORTLIST  ({len(setups)} setup{'s' if len(setups) != 1 else ''})")
-    for i, setup in enumerate(setups, 1):
-        scored = score_trade(setup, vix=pulse.vix)
-        display_trade_card(scored, trade_num=i)
-
-
-def cmd_pulse(_args: argparse.Namespace) -> None:
-    """Market pulse only."""
-    from src.market_pulse import get_market_pulse
-    from src.output import print_header, display_market_pulse
-
-    key = _require_key()
     print_header("MARKET PULSE")
-    display_market_pulse(get_market_pulse(key))
+    console.print(
+        f"SPX: [bold]${pulse.spx:,.2f}[/bold] ({pulse.spx_chg:+.2f}%)  "
+        f"SPY: ${pulse.spy:.2f}  QQQ: ${pulse.qqq:.2f}  IWM: ${pulse.iwm:.2f}\n"
+        f"VIX: [bold]{pulse.vix:.2f}[/bold] [{pulse.vix_label}]  "
+        f"IV 30d: {pulse.iv_30d*100:.1f}%  RV 20d: {pulse.rv_20d*100:.1f}%  "
+        f"Edge: {pulse.iv_rv_edge*100:+.1f} vol pts\n"
+        f"Overnight Gap: {pulse.overnight_gap_pct:+.2f}% [{pulse.gap_risk_label}]  "
+        f"Regime: [bold]{pulse.regime}[/bold]"
+    )
+    if pulse.events_today:
+        console.print(f"Events Today: [yellow]{', '.join(pulse.events_today)}[/yellow]")
+
+    display_market_classifier(verdict)
 
 
-def cmd_flow(args: argparse.Namespace) -> None:
-    """Unusual options flow for a specific ticker."""
-    from src.scanner import get_ticker_flow
-    from src.output import display_flow_signals, console
-
-    if not args.ticker:
-        console.print("[red]Usage: python agent.py flow TICKER[/red]")
-        return
-    ticker = args.ticker.upper()
-    key = _require_key()
-    try:
-        signals = get_ticker_flow(key, ticker)
-        display_flow_signals(ticker, signals)
-    except RuntimeError as exc:
-        console.print(f"[red]{exc}[/red]")
-
-
-def cmd_chart(args: argparse.Namespace) -> None:
-    """Technical summary for a specific ticker."""
-    from src.scanner import get_ticker_tech
-    from src.output import display_tech_summary, console
-
-    if not args.ticker:
-        console.print("[red]Usage: python agent.py chart TICKER[/red]")
-        return
-    ticker = args.ticker.upper()
-    key = _require_key()
-    try:
-        tech = get_ticker_tech(key, ticker)
-        display_tech_summary(tech)
-    except (RuntimeError, ValueError) as exc:
-        console.print(f"[red]{exc}[/red]")
-
-
-def cmd_size(args: argparse.Namespace) -> None:
-    """Position size for a given score."""
-    from src.scorer import calculate_size
-    from src.output import display_size_result, console
-
-    if not args.ticker or not args.score:
-        console.print("[red]Usage: python agent.py size TICKER SCORE[/red]")
-        return
-    try:
-        score = int(args.score)
-    except ValueError:
-        console.print("[red]SCORE must be an integer 1–25[/red]")
-        return
-    result = calculate_size(args.ticker.upper(), score)
-    display_size_result(result)
-
-
-def cmd_monitor(_args: argparse.Namespace) -> None:
-    """Check all open positions from positions.json."""
-    from src.monitor import check_positions, display_positions
-
-    key = _require_key()
-    statuses = check_positions(key)
-    display_positions(statuses)
-
-
-def cmd_explain(args: argparse.Namespace) -> None:
-    """Plain English breakdown of whether a ticker is a trade or not."""
-    from src.scanner import get_ticker_flow, get_ticker_tech, TradeSetup, _build_trade_setup
+def cmd_condor(args) -> None:
+    from src.market_pulse import get_market_pulse
+    from src.market_classifier import classify_market
+    from src.condor_builder import find_best_condor
     from src.scorer import score_trade
-    from src.output import display_trade_card, display_tech_summary, display_flow_signals, console
+    from src.output import display_iron_condor, display_scored_trade, display_market_classifier
 
-    if not args.ticker:
-        console.print("[red]Usage: python agent.py explain TICKER[/red]")
-        return
-    ticker = args.ticker.upper()
     key = _require_key()
+    account = getattr(args, "account", 5000.0)
+    dte_pref = getattr(args, "dte", "WEEKLY").upper()
 
-    console.rule(f"[bold cyan]ANALYSIS — {ticker}[/bold cyan]")
+    console.print("[dim]Fetching market data and building iron condor...[/dim]")
+    pulse = get_market_pulse(key)
+    verdict = classify_market(pulse)
 
-    # Technicals
-    try:
-        tech = get_ticker_tech(key, ticker)
-        display_tech_summary(tech)
-    except (RuntimeError, ValueError) as exc:
-        console.print(f"[red]Could not fetch technicals: {exc}[/red]")
+    print_header(f"IRON CONDOR — {dte_pref}")
+    display_market_classifier(verdict)
+
+    if verdict.signal == "RED":
+        console.print("[red bold]RED signal — no condor recommended today.[/red bold]")
         return
 
-    # Flow
-    try:
-        signals = get_ticker_flow(key, ticker)
-        display_flow_signals(ticker, signals)
-    except RuntimeError as exc:
-        console.print(f"[yellow]Flow data unavailable: {exc}[/yellow]")
-        return
-
-    if not signals:
-        console.print(
-            f"[yellow]NO TRADE — No unusual flow signals found for {ticker}. "
-            "Insufficient conviction to recommend a position.[/yellow]"
-        )
-        return
-
-    # Check if flow aligns with technicals
-    best = signals[0]
-    if tech.direction == "NEUTRAL":
-        console.print(
-            f"[yellow]NO TRADE — Technical direction is NEUTRAL for {ticker}. "
-            "Need a clear trend before entering.[/yellow]"
-        )
-        return
-    if best.direction != tech.direction:
-        console.print(
-            f"[yellow]NO TRADE — Flow is {best.direction} but technicals are {tech.direction}. "
-            "Conflicting signals — standing down.[/yellow]"
-        )
-        return
-
-    setup = _build_trade_setup(best, tech)
-    scored = score_trade(setup)
-    display_trade_card(scored, trade_num=1)
+    condor = find_best_condor(key, account_size=account, dte_preference=dte_pref, pulse=pulse)
+    display_iron_condor(condor)
+    scored = score_trade(condor, verdict)
+    display_scored_trade(scored)
 
 
-def cmd_exit(args: argparse.Namespace) -> None:
-    """Exit recommendation for a specific open position."""
-    from src.monitor import check_single_exit
-    from src.output import console
+def cmd_strikes(args) -> None:
+    from src.market_pulse import get_market_pulse
+    from src.strike_selector import select_strikes
+    from src.spread_builder import _find_next_expiry
+    from src.output import display_strike_recommendation
+    from datetime import date
 
-    if not args.ticker:
-        console.print("[red]Usage: python agent.py exit TICKER[/red]")
-        return
-    check_single_exit(_require_key(), args.ticker.upper())
+    key = _require_key()
+    ticker = args.ticker.upper()
+    win_rate = getattr(args, "win_rate", 0.84)
+
+    console.print(f"[dim]Fetching data and computing strikes for {ticker}...[/dim]")
+    pulse = get_market_pulse(key)
+    iv = pulse.iv_30d or 0.18
+    price = pulse.spx if ticker in ("SPX", "I:SPX") else pulse.spy * 10
+
+    expiry = _find_next_expiry(14)
+    dte = (date.fromisoformat(expiry) - date.today()).days
+
+    rec = select_strikes(
+        underlying=ticker,
+        current_price=price,
+        expiry=expiry,
+        dte=dte,
+        iv=iv,
+        target_win_rate=win_rate,
+        events_today=pulse.events_today,
+    )
+    display_strike_recommendation(rec)
 
 
-# ── CLI setup ─────────────────────────────────────────────────────────────────
+def cmd_theta(args) -> None:
+    from src.market_pulse import get_market_pulse
+    from src.theta_calculator import build_theta_report
+    from src.output import display_theta_report
+
+    key = _require_key()
+    account = getattr(args, "account", 5000.0)
+    pulse = get_market_pulse(key)
+    spx = pulse.spx or 5000.0
+    iv = pulse.iv_30d or 0.18
+
+    report = build_theta_report(underlying_price=spx, iv=iv, account_size=account)
+    display_theta_report(report)
+
+
+def cmd_monitor(args) -> None:
+    from src.monitor import check_spread_positions
+    from src.output import display_spread_positions
+
+    key = _require_key()
+    statuses = check_spread_positions(key)
+    display_spread_positions(statuses)
+
+
+def cmd_size(args) -> None:
+    from src.config import CAPITAL, MAX_RISK_PCT
+
+    account = getattr(args, "account", CAPITAL)
+    score = int(args.score)
+    credit = float(args.credit)
+    spread_width = getattr(args, "width", 5.0)
+
+    max_risk = account * MAX_RISK_PCT
+    max_loss_per_contract = (spread_width - credit) * 100
+    contracts = max(1, int(max_risk / max_loss_per_contract)) if max_loss_per_contract > 0 else 0
+
+    if score < 15:
+        verdict = "[red]NO TRADE — score below 15[/red]"
+        contracts = 0
+    elif score < 20:
+        max_risk = account * 0.03
+        contracts = max(1, int(max_risk / max_loss_per_contract)) if max_loss_per_contract > 0 else 0
+        verdict = "[yellow]SMALL TRADE (score 15–19)[/yellow]"
+    else:
+        verdict = "[green]STANDARD TRADE (score 20–25)[/green]"
+
+    print_header("POSITION SIZE")
+    console.print(
+        f"Score: {score}/25  Credit: ${credit:.2f}  Width: ${spread_width:.0f}  Account: ${account:,.0f}\n"
+        f"Max Loss/Contract: ${max_loss_per_contract:.0f}  "
+        f"Max Risk Budget: ${max_risk:.0f}\n"
+        f"Contracts: [bold]{contracts}[/bold]  Total Credit: ${credit * contracts * 100:.0f}\n"
+        f"Verdict: {verdict}"
+    )
+
+
+def cmd_goal(args) -> None:
+    from src.goal_engine import calculate_goal_profile
+    from src.output import display_goal_profile
+
+    target = float(args.target)
+    days = int(args.days)
+    account = getattr(args, "account", 5000.0)
+
+    profile = calculate_goal_profile(target, days, account)
+    display_goal_profile(profile)
+
+
+# ── CLI wiring ────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Options Research & Signal Agent",
+        description="Options Agent V2 — SPX Credit Spreads & Iron Condors",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
     )
-    sub = parser.add_subparsers(dest="command", metavar="command")
+    parser.add_argument("--account", type=float, default=5000.0, help="Account size (default 5000)")
+    sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("scan", help="Full pipeline scan")
-    sub.add_parser("pulse", help="Market pulse only")
+    sub.add_parser("scan", help="Full pipeline: classify → credit spread")
+    sub.add_parser("pulse", help="Market pulse + GREEN/YELLOW/RED verdict")
 
-    p_flow = sub.add_parser("flow", help="Options flow for a ticker")
-    p_flow.add_argument("ticker", nargs="?")
+    p_condor = sub.add_parser("condor", help="Build iron condor on best index")
+    p_condor.add_argument("dte", nargs="?", default="WEEKLY", choices=["WEEKLY", "MONTHLY"])
 
-    p_chart = sub.add_parser("chart", help="Technical summary for a ticker")
-    p_chart.add_argument("ticker", nargs="?")
+    p_strikes = sub.add_parser("strikes", help="Probability-based strike selection")
+    p_strikes.add_argument("ticker", help="Ticker symbol (e.g. SPX)")
+    p_strikes.add_argument("--win-rate", type=float, default=0.84, dest="win_rate")
 
-    p_size = sub.add_parser("size", help="Position size calculator")
-    p_size.add_argument("ticker", nargs="?")
-    p_size.add_argument("score", nargs="?")
+    sub.add_parser("theta", help="Theta decay for open positions")
+    sub.add_parser("monitor", help="Check open spread positions")
 
-    sub.add_parser("monitor", help="Check open positions")
+    p_size = sub.add_parser("size", help="Position sizing calculator")
+    p_size.add_argument("score", help="Trade score (0–25)")
+    p_size.add_argument("credit", help="Net credit received per share")
+    p_size.add_argument("--width", type=float, default=5.0)
 
-    p_explain = sub.add_parser("explain", help="Plain English trade analysis")
-    p_explain.add_argument("ticker", nargs="?")
-
-    p_exit = sub.add_parser("exit", help="Should I exit this position?")
-    p_exit.add_argument("ticker", nargs="?")
+    p_goal = sub.add_parser("goal", help="Goal wizard (e.g. goal 500 30)")
+    p_goal.add_argument("target", help="Target profit in dollars")
+    p_goal.add_argument("days", help="Days to achieve goal")
 
     args = parser.parse_args()
 
     dispatch = {
         "scan": cmd_scan,
         "pulse": cmd_pulse,
-        "flow": cmd_flow,
-        "chart": cmd_chart,
-        "size": cmd_size,
+        "condor": cmd_condor,
+        "strikes": cmd_strikes,
+        "theta": cmd_theta,
         "monitor": cmd_monitor,
-        "explain": cmd_explain,
-        "exit": cmd_exit,
+        "size": cmd_size,
+        "goal": cmd_goal,
     }
 
-    if args.command in dispatch:
-        dispatch[args.command](args)
+    if not args.command:
+        parser.print_help()
+        return
+
+    handler = dispatch.get(args.command)
+    if handler:
+        handler(args)
     else:
         parser.print_help()
 
